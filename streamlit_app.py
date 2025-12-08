@@ -226,7 +226,7 @@ def main_app():
     if not bulk_data:
         st.warning("暂无数据"); st.stop()
 
-    # --- 计算统计数据 (核心修改部分) ---
+    # --- 计算统计数据 (修复版) ---
     ranking_data = []
     for sym, df in bulk_data.items():
         if df.empty or len(df) < 2: continue
@@ -241,23 +241,41 @@ def main_app():
         
         intensity = 0
         market_cap = 0
+        
+        # --- 修复开始：安全的数据类型转换 ---
         supply = 0
+        db_market_cap = 0
         
-        # 1. 尝试获取流通量
         if token_info:
-            supply = token_info.get('circulating_supply', 0)
-        
-        # 2. 优先逻辑：动态计算市值 (实时价格 * 流通量)
-        if supply and supply > 0:
+            # 1. 安全获取流通量并转为 float
+            try:
+                raw_supply = token_info.get('circulating_supply')
+                if raw_supply is not None:
+                    supply = float(raw_supply)
+            except (ValueError, TypeError):
+                supply = 0
+            
+            # 2. 安全获取数据库市值并转为 float (备用)
+            try:
+                raw_mc = token_info.get('market_cap')
+                if raw_mc is not None:
+                    db_market_cap = float(raw_mc)
+            except (ValueError, TypeError):
+                db_market_cap = 0
+        # --- 修复结束 ---
+
+        # 逻辑判断
+        # 优先逻辑：动态计算市值 (实时价格 * 流通量)
+        if supply > 0:
             market_cap = supply * current_price
             intensity = oi_growth_usd / market_cap
             
-        # 3. 降级逻辑：如果有静态市值数据，使用静态数据
-        elif token_info and token_info.get('market_cap') and token_info['market_cap'] > 0:
-            market_cap = token_info['market_cap']
+        # 降级逻辑：如果有静态市值数据，使用静态数据
+        elif db_market_cap > 0:
+            market_cap = db_market_cap
             intensity = oi_growth_usd / market_cap
             
-        # 4. 再次降级：没有市值数据，使用 OI 基数进行估算 (强度 = 增量 / 最小OI * 0.1)
+        # 再次降级：没有市值数据，使用 OI 基数进行估算
         else:
             if min_oi > 0: intensity = (oi_growth_tokens / min_oi) * 0.1
 
@@ -267,7 +285,6 @@ def main_app():
             "oi_growth_usd": oi_growth_usd,
             "market_cap": market_cap
         })
-
     # ==========================
     # 榜单指标区 (Metric Lists)
     # ==========================
