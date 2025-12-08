@@ -48,7 +48,7 @@ def get_connection(db_name):
 def fetch_circulating_supply():
     try:
         with get_connection(DB_NAME_SUPPLY) as conn:
-            # 修改点 1：表名改为 binance_circulating_supply
+            # 表名: binance_circulating_supply
             sql = f"SELECT symbol, circulating_supply, market_cap FROM `binance_circulating_supply`"
             df = pd.read_sql(sql, conn)
             return df.set_index('symbol').to_dict('index')
@@ -60,7 +60,7 @@ def fetch_circulating_supply():
 def get_sorted_symbols_by_oi_usd():
     try:
         with get_connection(DB_NAME_OI) as conn:
-            # 修改点 2：表名改为 binance
+            # 表名: binance
             sql = f"SELECT symbol FROM `binance` GROUP BY symbol ORDER BY MAX(oi_usd) DESC;"
             df = pd.read_sql(sql, conn)
             return df['symbol'].tolist()
@@ -73,7 +73,7 @@ def fetch_bulk_data_one_shot(symbol_list):
     if not symbol_list: return {}
     placeholders = ', '.join(['%s'] * len(symbol_list))
     
-    # 修改点 3：表名改为 binance
+    # 表名: binance
     sql_query = f"""
     WITH RankedData AS (
         SELECT symbol, `time`, `price`, `oi`,
@@ -150,7 +150,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
     """
     raw_df = bulk_data.get(symbol)
     
-    # 修改点 4：Coinglass 链接改为 Binance
+    # Coinglass 链接改为 Binance
     coinglass_url = f"https://www.coinglass.com/tv/zh/Binance_{symbol}USDT"
     
     title_color = "black"
@@ -208,8 +208,8 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
 # --- D. 主程序 ---
 
 def main_app():
-    st.set_page_config(layout="wide", page_title="Binance OI Dashboard") # 修改页面标题
-    st.title("⚡ Binance OI 双塔监控 (强度 vs 巨鲸)") # 修改标题
+    st.set_page_config(layout="wide", page_title="Binance OI Dashboard")
+    st.title("⚡ Binance OI 双塔监控 (强度 vs 巨鲸)")
     
     with st.spinner("正在读取流通量数据库..."):
         supply_data = fetch_circulating_supply()
@@ -218,7 +218,7 @@ def main_app():
         sorted_symbols = get_sorted_symbols_by_oi_usd()
         if not sorted_symbols: st.stop()
         
-        # 修改点 5：合约个数由前100改为前150
+        # 监控前150个合约
         target_symbols = sorted_symbols[:150]
         
         bulk_data = fetch_bulk_data_one_shot(target_symbols)
@@ -226,7 +226,7 @@ def main_app():
     if not bulk_data:
         st.warning("暂无数据"); st.stop()
 
-    # --- 计算统计数据 ---
+    # --- 计算统计数据 (核心修改部分) ---
     ranking_data = []
     for sym, df in bulk_data.items():
         if df.empty or len(df) < 2: continue
@@ -241,12 +241,23 @@ def main_app():
         
         intensity = 0
         market_cap = 0
-        if token_info and token_info.get('market_cap') and token_info['market_cap'] > 0:
+        supply = 0
+        
+        # 1. 尝试获取流通量
+        if token_info:
+            supply = token_info.get('circulating_supply', 0)
+        
+        # 2. 优先逻辑：动态计算市值 (实时价格 * 流通量)
+        if supply and supply > 0:
+            market_cap = supply * current_price
+            intensity = oi_growth_usd / market_cap
+            
+        # 3. 降级逻辑：如果有静态市值数据，使用静态数据
+        elif token_info and token_info.get('market_cap') and token_info['market_cap'] > 0:
             market_cap = token_info['market_cap']
             intensity = oi_growth_usd / market_cap
-        elif token_info and token_info.get('circulating_supply') and token_info['circulating_supply'] > 0:
-            supply = token_info['circulating_supply']
-            intensity = oi_growth_tokens / supply
+            
+        # 4. 再次降级：没有市值数据，使用 OI 基数进行估算 (强度 = 增量 / 最小OI * 0.1)
         else:
             if min_oi > 0: intensity = (oi_growth_tokens / min_oi) * 0.1
 
@@ -272,7 +283,7 @@ def main_app():
     # --- 左侧指标：Top 10 强度 ---
     with col_left:
         st.subheader("🔥 Top 10 强度榜 (相对比例)")
-        st.caption("逻辑：(当前OI - 最低OI) / 市值。")
+        st.caption("逻辑：(当前OI - 最低OI) * 价格 / 实时市值")
         st.markdown("---")
         for i, item in enumerate(top_intensity):
             st.metric(
