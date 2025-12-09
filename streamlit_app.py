@@ -17,7 +17,7 @@ DB_NAME_OI = 'open_interest_db'
 DB_NAME_SUPPLY = 'circulating_supply'
 
 DATA_LIMIT_RAW = 4000
-SAMPLE_STEP = 10 
+SAMPLE_STEP = 5 
 
 # --- B. 数据库功能 (并发 + Rust) ---
 
