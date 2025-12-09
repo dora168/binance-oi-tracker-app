@@ -1,9 +1,9 @@
 import streamlit as st
 import pandas as pd
 import altair as alt
-import pymysql
 import os
-from contextlib import contextmanager
+import connectorx as cx  # 🚀 Rust 编写的高性能数据加载库
+from urllib.parse import quote_plus
 
 # --- A. 数据库配置 ----
 
@@ -11,47 +11,39 @@ DB_HOST = os.getenv("DB_HOST") or st.secrets.get("DB_HOST", "cd-cdb-p6vea42o.sql
 DB_PORT = int(os.getenv("DB_PORT") or st.secrets.get("DB_PORT", 24197))
 DB_USER = os.getenv("DB_USER") or st.secrets.get("DB_USER", "root")
 DB_PASSWORD = os.getenv("DB_PASSWORD") or st.secrets.get("DB_PASSWORD", None)
-DB_CHARSET = 'utf8mb4'
+# 注意: ConnectorX 自动处理 UTF8，不需要显式配置 DB_CHARSET
 
 DB_NAME_OI = 'open_interest_db'
 DB_NAME_SUPPLY = 'circulating_supply'
-DATA_LIMIT = 4000
 
-# --- B. 数据库功能 ---
+# 策略：查看过去 4000 个周期的数据范围，但在 SQL 中进行过滤
+DATA_LIMIT_RAW = 4000
+SAMPLE_STEP = 10  # SQL层面每10行取1行
+
+# --- B. 数据库功能 (Rust 加速版) ---
 
 @st.cache_resource
-def get_db_connection_params(db_name):
+def get_db_uri(db_name):
+    """构建 connectorx 需要的连接字符串 (mysql://...)"""
     if not DB_PASSWORD:
         st.error("❌ 数据库密码未配置。")
         st.stop()
-    return {
-        'host': DB_HOST,
-        'port': DB_PORT,
-        'user': DB_USER,
-        'password': DB_PASSWORD,
-        'db': db_name,
-        'charset': DB_CHARSET,
-        'autocommit': True,
-        'connect_timeout': 10
-    }
+    
+    # 1. URL 编码密码，防止特殊字符破坏连接串
+    safe_pwd = quote_plus(DB_PASSWORD)
+    
+    # 2. 移除 charset 参数，修复 'Unknown URL parameter' 错误
+    return f"mysql://{DB_USER}:{safe_pwd}@{DB_HOST}:{DB_PORT}/{db_name}"
 
-@contextmanager
-def get_connection(db_name):
-    params = get_db_connection_params(db_name)
-    conn = pymysql.connect(**params)
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-@st.cache_data(ttl=1)
+@st.cache_data(ttl=300)
 def fetch_circulating_supply():
     try:
-        with get_connection(DB_NAME_SUPPLY) as conn:
-            # 表名: binance_circulating_supply
-            sql = f"SELECT symbol, circulating_supply, market_cap FROM `binance_circulating_supply`"
-            df = pd.read_sql(sql, conn)
-            return df.set_index('symbol').to_dict('index')
+        uri = get_db_uri(DB_NAME_SUPPLY)
+        # 表名: binance_circulating_supply
+        query = f"SELECT symbol, circulating_supply, market_cap FROM `binance_circulating_supply`"
+        # 使用 Rust 引擎读取
+        df = cx.read_sql(uri, query)
+        return df.set_index('symbol').to_dict('index')
     except Exception as e:
         print(f"⚠️ 流通量数据读取失败: {e}")
         return {}
@@ -59,11 +51,11 @@ def fetch_circulating_supply():
 @st.cache_data(ttl=60)
 def get_sorted_symbols_by_oi_usd():
     try:
-        with get_connection(DB_NAME_OI) as conn:
-            # 表名: binance
-            sql = f"SELECT symbol FROM `binance` GROUP BY symbol ORDER BY MAX(oi_usd) DESC;"
-            df = pd.read_sql(sql, conn)
-            return df['symbol'].tolist()
+        uri = get_db_uri(DB_NAME_OI)
+        # 表名: binance
+        query = "SELECT symbol FROM `binance` GROUP BY symbol ORDER BY MAX(oi_usd) DESC"
+        df = cx.read_sql(uri, query)
+        return df['symbol'].tolist()
     except Exception as e:
         st.error(f"❌ 列表获取失败: {e}")
         return []
@@ -71,27 +63,40 @@ def get_sorted_symbols_by_oi_usd():
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_bulk_data_one_shot(symbol_list):
     if not symbol_list: return {}
-    placeholders = ', '.join(['%s'] * len(symbol_list))
     
+    symbols_str = "', '".join(symbol_list)
+    
+    # 🌟 SQL 优化核心：只回传 rn=1 (最新) 以及 rn % 10 == 0 (每隔10条) 的数据
     # 表名: binance
     sql_query = f"""
     WITH RankedData AS (
         SELECT symbol, `time`, `price`, `oi`,
         ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY `time` DESC) as rn
         FROM `binance`
-        WHERE symbol IN ({placeholders})
+        WHERE symbol IN ('{symbols_str}')
     )
     SELECT symbol, `time`, `price` AS `标记价格 (USDC)`, `oi` AS `未平仓量`
     FROM RankedData
-    WHERE rn <= %s
+    WHERE rn <= {DATA_LIMIT_RAW} 
+    AND (rn = 1 OR rn % {SAMPLE_STEP} = 0)
     ORDER BY symbol, `time` ASC;
     """
     
     try:
-        with get_connection(DB_NAME_OI) as conn:
-            df_all = pd.read_sql(sql_query, conn, params=tuple(symbol_list) + (DATA_LIMIT,))
+        uri = get_db_uri(DB_NAME_OI)
+        # Rust 零拷贝读取
+        df_all = cx.read_sql(uri, sql_query)
         
         if df_all.empty: return {}
+        
+        # 确保时间格式正确
+        if not pd.api.types.is_datetime64_any_dtype(df_all['time']):
+            df_all['time'] = pd.to_datetime(df_all['time'])
+            
+        # 确保数值格式正确 (防止数据库返回 Decimal 类型导致 Altair 报错)
+        df_all['标记价格 (USDC)'] = df_all['标记价格 (USDC)'].astype(float)
+        df_all['未平仓量'] = df_all['未平仓量'].astype(float)
+
         return {sym: group for sym, group in df_all.groupby('symbol')}
     except Exception as e:
         st.error(f"⚠️ 数据查询失败: {e}")
@@ -106,12 +111,13 @@ def format_number(num):
     else: return f"{num:.0f}"
 
 def downsample_data(df, target_points=400):
-    if len(df) <= target_points: return df
+    # 因为我们在 SQL 里已经做了降采样，这里主要做一个保险
+    # 如果数据量已经很小，直接返回
+    if len(df) <= target_points * 1.5: 
+        return df
+    # 简单的步长切片
     step = len(df) // target_points
-    df_sampled = df.iloc[::step].copy()
-    if df.index[-1] not in df_sampled.index:
-        df_sampled = pd.concat([df_sampled, df.iloc[[-1]]])
-    return df_sampled
+    return df.iloc[::step]
 
 axis_format_logic = """
 datum.value >= 1000000000 ? format(datum.value / 1000000000, ',.2f') + 'B' : 
@@ -122,8 +128,6 @@ format(datum.value, ',.0f')
 
 def create_dual_axis_chart(df, symbol):
     if df.empty: return None
-    if not pd.api.types.is_datetime64_any_dtype(df['time']):
-        df['time'] = pd.to_datetime(df['time'])
     df = df.reset_index(drop=True)
     df['index'] = df.index
     tooltip_fields = [
@@ -150,7 +154,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
     """
     raw_df = bulk_data.get(symbol)
     
-    # Coinglass 链接改为 Binance
+    # Binance 链接
     coinglass_url = f"https://www.coinglass.com/tv/zh/Binance_{symbol}USDT"
     
     title_color = "black"
@@ -209,7 +213,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
 
 def main_app():
     st.set_page_config(layout="wide", page_title="Binance OI Dashboard")
-    st.title("⚡ Binance OI 双塔监控 (强度 vs 巨鲸)")
+    st.title("⚡ Binance OI 双塔监控 (强度 vs 巨鲸) - Rust Accelerated")
     
     with st.spinner("正在读取流通量数据库..."):
         supply_data = fetch_circulating_supply()
@@ -226,7 +230,7 @@ def main_app():
     if not bulk_data:
         st.warning("暂无数据"); st.stop()
 
-    # --- 计算统计数据 (修复版) ---
+    # --- 计算统计数据 ---
     ranking_data = []
     for sym, df in bulk_data.items():
         if df.empty or len(df) < 2: continue
@@ -242,12 +246,12 @@ def main_app():
         intensity = 0
         market_cap = 0
         
-        # --- 修复开始：安全的数据类型转换 ---
+        # --- 安全的数据类型转换逻辑 ---
         supply = 0
         db_market_cap = 0
         
         if token_info:
-            # 1. 安全获取流通量并转为 float
+            # 1. 安全获取流通量
             try:
                 raw_supply = token_info.get('circulating_supply')
                 if raw_supply is not None:
@@ -255,14 +259,13 @@ def main_app():
             except (ValueError, TypeError):
                 supply = 0
             
-            # 2. 安全获取数据库市值并转为 float (备用)
+            # 2. 安全获取数据库市值
             try:
                 raw_mc = token_info.get('market_cap')
                 if raw_mc is not None:
                     db_market_cap = float(raw_mc)
             except (ValueError, TypeError):
                 db_market_cap = 0
-        # --- 修复结束 ---
 
         # 逻辑判断
         # 优先逻辑：动态计算市值 (实时价格 * 流通量)
@@ -285,6 +288,7 @@ def main_app():
             "oi_growth_usd": oi_growth_usd,
             "market_cap": market_cap
         })
+
     # ==========================
     # 榜单指标区 (Metric Lists)
     # ==========================
