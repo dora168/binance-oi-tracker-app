@@ -1,735 +1,413 @@
 import streamlit as st
-
 import pandas as pd
-
 import altair as alt
-
 import pymysql
-
 import os
-
 from contextlib import contextmanager
-
-
+import streamlit.components.v1 as components  # <--- 新增引用
 
 # --- A. 数据库配置 ----
 
-
-
 DB_HOST = os.getenv("DB_HOST") or st.secrets.get("DB_HOST", "cd-cdb-p6vea42o.sql.tencentcdb.com")
-
 DB_PORT = int(os.getenv("DB_PORT") or st.secrets.get("DB_PORT", 24197))
-
 DB_USER = os.getenv("DB_USER") or st.secrets.get("DB_USER", "root")
-
 DB_PASSWORD = os.getenv("DB_PASSWORD") or st.secrets.get("DB_PASSWORD", None)
-
 DB_CHARSET = 'utf8mb4'
 
-
-
 DB_NAME_OI = 'open_interest_db'
-
 DB_NAME_SUPPLY = 'circulating_supply'
-
 DATA_LIMIT = 4000
-
-
 
 # --- B. 数据库功能 ---
 
-
-
 @st.cache_resource
-
 def get_db_connection_params(db_name):
-
     if not DB_PASSWORD:
-
         st.error("❌ 数据库密码未配置。")
-
         st.stop()
-
     return {
-
         'host': DB_HOST,
-
         'port': DB_PORT,
-
         'user': DB_USER,
-
         'password': DB_PASSWORD,
-
         'db': db_name,
-
         'charset': DB_CHARSET,
-
         'autocommit': True,
-
         'connect_timeout': 10
-
     }
 
-
-
 @contextmanager
-
 def get_connection(db_name):
-
     params = get_db_connection_params(db_name)
-
     conn = pymysql.connect(**params)
-
     try:
-
         yield conn
-
     finally:
-
         conn.close()
 
-
-
-@st.cache_data(ttl=1)
-
+@st.cache_data(ttl=300) # 流通量不常变，缓存久一点
 def fetch_circulating_supply():
-
     try:
-
         with get_connection(DB_NAME_SUPPLY) as conn:
-
             # 表名: binance_circulating_supply
-
             sql = f"SELECT symbol, circulating_supply, market_cap FROM `binance_circulating_supply`"
-
             df = pd.read_sql(sql, conn)
-
             return df.set_index('symbol').to_dict('index')
-
     except Exception as e:
-
         print(f"⚠️ 流通量数据读取失败: {e}")
-
         return {}
-
-
 
 @st.cache_data(ttl=60)
-
 def get_sorted_symbols_by_oi_usd():
-
     try:
-
         with get_connection(DB_NAME_OI) as conn:
-
             # 表名: binance
-
             sql = f"SELECT symbol FROM `binance` GROUP BY symbol ORDER BY MAX(oi_usd) DESC;"
-
             df = pd.read_sql(sql, conn)
-
             return df['symbol'].tolist()
-
     except Exception as e:
-
         st.error(f"❌ 列表获取失败: {e}")
-
         return []
 
-
-
 @st.cache_data(ttl=60, show_spinner=False)
-
 def fetch_bulk_data_one_shot(symbol_list):
-
     if not symbol_list: return {}
-
     placeholders = ', '.join(['%s'] * len(symbol_list))
-
     
-
     # 表名: binance
-
     sql_query = f"""
-
     WITH RankedData AS (
-
         SELECT symbol, `time`, `price`, `oi`,
-
         ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY `time` DESC) as rn
-
         FROM `binance`
-
         WHERE symbol IN ({placeholders})
-
     )
-
     SELECT symbol, `time`, `price` AS `标记价格 (USDC)`, `oi` AS `未平仓量`
-
     FROM RankedData
-
     WHERE rn <= %s
-
     ORDER BY symbol, `time` ASC;
-
     """
-
     
-
     try:
-
         with get_connection(DB_NAME_OI) as conn:
-
             df_all = pd.read_sql(sql_query, conn, params=tuple(symbol_list) + (DATA_LIMIT,))
-
         
-
         if df_all.empty: return {}
-
         return {sym: group for sym, group in df_all.groupby('symbol')}
-
     except Exception as e:
-
         st.error(f"⚠️ 数据查询失败: {e}")
-
         return {}
-
-
 
 # --- C. 辅助与绘图 ---
 
-
-
 def format_number(num):
-
     if abs(num) >= 1_000_000_000: return f"{num / 1_000_000_000:.2f}B"
-
     elif abs(num) >= 1_000_000: return f"{num / 1_000_000:.2f}M"
-
     elif abs(num) >= 1_000: return f"{num / 1_000:.1f}K"
-
     else: return f"{num:.0f}"
 
-
-
 def downsample_data(df, target_points=400):
-
     if len(df) <= target_points: return df
-
     step = len(df) // target_points
-
     df_sampled = df.iloc[::step].copy()
-
     if df.index[-1] not in df_sampled.index:
-
         df_sampled = pd.concat([df_sampled, df.iloc[[-1]]])
-
     return df_sampled
 
-
-
 axis_format_logic = """
-
 datum.value >= 1000000000 ? format(datum.value / 1000000000, ',.2f') + 'B' : 
-
 datum.value >= 1000000 ? format(datum.value / 1000000, ',.2f') + 'M' : 
-
 datum.value >= 1000 ? format(datum.value / 1000, ',.1f') + 'K' : 
-
 format(datum.value, ',.0f')
-
 """
 
-
-
 def create_dual_axis_chart(df, symbol):
-
     if df.empty: return None
-
     if not pd.api.types.is_datetime64_any_dtype(df['time']):
-
         df['time'] = pd.to_datetime(df['time'])
-
     df = df.reset_index(drop=True)
-
     df['index'] = df.index
-
     tooltip_fields = [
-
         alt.Tooltip('time', title='时间', format="%m-%d %H:%M"),
-
         alt.Tooltip('标记价格 (USDC)', title='价格', format='$,.4f'),
-
         alt.Tooltip('未平仓量', title='OI', format=',.0f') 
-
     ]
-
     base = alt.Chart(df).encode(alt.X('index', title=None, axis=alt.Axis(labels=False)))
-
     line_price = base.mark_line(color='#d62728', strokeWidth=2).encode(
-
         alt.Y('标记价格 (USDC)', axis=alt.Axis(title='', titleColor='#d62728', orient='right'), scale=alt.Scale(zero=False))
-
     )
-
     line_oi = base.mark_line(color='purple', strokeWidth=2).encode(
-
         alt.Y('未平仓量', axis=alt.Axis(title='OI', titleColor='purple', orient='right', offset=45, labelExpr=axis_format_logic), scale=alt.Scale(zero=False))
-
     )
-
     chart = alt.layer(line_price, line_oi).resolve_scale(y='independent').encode(
-
         tooltip=tooltip_fields
-
     ).properties(height=450)
-
     return chart
 
-
-
-def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=False, list_type=""):
-
+# --- 新增: TradingView Widget 渲染函数 ---
+def render_tradingview_widget(symbol, height=400):
     """
+    渲染 TradingView Widget。
+    优点：不消耗服务器流量，交互性好。
+    注意：不要在一个页面渲染超过20个，否则浏览器会卡。
+    """
+    container_id = f"tv_{symbol}"
+    # 构造币安合约 Symbol，例如 BINANCE:BTCUSDT.P
+    tv_symbol = f"BINANCE:{symbol}USDT.P"
 
+    html_code = f"""
+    <div class="tradingview-widget-container" style="height:100%;width:100%">
+      <div id="{container_id}" style="height:calc(100% - 32px);width:100%"></div>
+      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+      <script type="text/javascript">
+      new TradingView.widget(
+      {{
+        "autosize": true,
+        "symbol": "{tv_symbol}",
+        "interval": "15",
+        "timezone": "Asia/Shanghai",
+        "theme": "dark",
+        "style": "1",
+        "locale": "zh_CN",
+        "enable_publishing": false,
+        "hide_top_toolbar": false,
+        "hide_legend": true,
+        "save_image": false,
+        "container_id": "{container_id}",
+        "studies": ["MASimple@tv-basicstudies"],
+        "disabled_features": ["header_symbol_search", "header_compare"]
+      }}
+      );
+      </script>
+    </div>
+    """
+    components.html(html_code, height=height)
+
+def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=False, list_type="", use_tv=False):
+    """
     渲染单个图表组件
-
-    list_type: 用于区分 'strength' 或 'whale'，方便生成唯一的 key
-
+    use_tv: 是否使用 TradingView 替代 Altair (建议只对 Top 10 使用)
     """
-
     raw_df = bulk_data.get(symbol)
-
     
-
     # Coinglass 链接改为 Binance
-
     coinglass_url = f"https://www.coinglass.com/tv/zh/Binance_{symbol}USDT"
-
     
-
     title_color = "black"
-
     chart = None
-
     info_html = ""
-
     
-
     if raw_df is not None and not raw_df.empty:
-
         start_p = raw_df['标记价格 (USDC)'].iloc[0]
-
         end_p = raw_df['标记价格 (USDC)'].iloc[-1]
-
         title_color = "#009900" if end_p >= start_p else "#D10000"
-
         
-
         # 获取统计信息
-
         item_stats = next((item for item in ranking_data if item["symbol"] == symbol), None)
-
         if item_stats:
-
             int_val = item_stats['intensity'] * 100
-
             int_color = "#d62728" if int_val > 5 else ("#009900" if int_val > 1 else "#555")
-
             growth_usd = item_stats['oi_growth_usd']
-
             growth_str = format_number(growth_usd)
-
             
-
             info_html = (
-
                 f'<span style="font-size: 14px; margin-left: 10px; color: #666;">'
-
                 f'强度:<span style="color: {int_color}; font-weight: bold;">{int_val:.1f}%</span>'
-
                 f'<span style="margin: 0 4px;">|</span>'
-
                 f'增量:<span style="color: #009900; font-weight: bold;">+${growth_str}</span>'
-
                 f'</span>'
-
             )
-
-
-
-        chart_df = downsample_data(raw_df, target_points=400)
-
-        chart = create_dual_axis_chart(chart_df, symbol)
-
-
+        
+        # 只有当不使用 TradingView 时，才计算 Altair 图表
+        if not use_tv:
+            chart_df = downsample_data(raw_df, target_points=400)
+            chart = create_dual_axis_chart(chart_df, symbol)
 
     # 标题生成
-
     fire_icon = "🔥" if list_type == "strength" else ("🐳" if list_type == "whale" else "")
-
     expander_title_html = (
-
         f'<div style="text-align: center; margin-bottom: 5px;">'
-
         f'{fire_icon} '
-
         f'<a href="{coinglass_url}" target="_blank" '
-
         f'style="text-decoration:none; color:{title_color}; font-weight:bold; font-size:20px;">'
-
         f' {symbol} </a>'
-
         f'{info_html}'
-
         f'</div>'
-
     )
-
     
-
     if is_top_mover:
-
         label = f"{fire_icon} {symbol}"
-
     else:
-
         label = f"#{rank} {symbol}"
 
-
-
+    # 这里的 expanded=True 配合 use_container_width=True 会自动适应左右分栏的宽度
     with st.expander(label, expanded=True):
-
         st.markdown(expander_title_html, unsafe_allow_html=True)
-
-        if chart:
-
+        
+        if use_tv:
+            # 使用 TradingView
+            render_tradingview_widget(symbol, height=350)
+        elif chart:
+            # 使用 Altair (Python 画图)
             st.altair_chart(chart, use_container_width=True)
-
         else:
-
             st.info("暂无数据")
-
-
 
 # --- D. 主程序 ---
 
-
-
 def main_app():
-
     st.set_page_config(layout="wide", page_title="Binance OI Dashboard")
-
-    st.title("⚡ Binance OI 双塔监控 (强度 vs 巨鲸)")
-
+    st.title("⚡ Binance OI 双塔监控 (TradingView 集成版)")
     
-
     with st.spinner("正在读取流通量数据库..."):
-
         supply_data = fetch_circulating_supply()
-
         
-
     with st.spinner("正在加载市场数据..."):
-
         sorted_symbols = get_sorted_symbols_by_oi_usd()
-
         if not sorted_symbols: st.stop()
-
         
-
         # 监控前150个合约
-
         target_symbols = sorted_symbols[:150]
-
         
-
         bulk_data = fetch_bulk_data_one_shot(target_symbols)
 
-
-
     if not bulk_data:
-
         st.warning("暂无数据"); st.stop()
 
-
-
     # --- 计算统计数据 (修复版) ---
-
     ranking_data = []
-
     for sym, df in bulk_data.items():
-
         if df.empty or len(df) < 2: continue
-
         
-
         token_info = supply_data.get(sym)
-
         current_price = df['标记价格 (USDC)'].iloc[-1]
-
         
-
         min_oi = df['未平仓量'].min()
-
         current_oi = df['未平仓量'].iloc[-1]
-
         oi_growth_tokens = current_oi - min_oi
-
         oi_growth_usd = oi_growth_tokens * current_price
-
         
-
         intensity = 0
-
         market_cap = 0
-
         
-
         # --- 修复开始：安全的数据类型转换 ---
-
         supply = 0
-
         db_market_cap = 0
-
         
-
         if token_info:
-
-            # 1. 安全获取流通量并转为 float
-
             try:
-
                 raw_supply = token_info.get('circulating_supply')
-
                 if raw_supply is not None:
-
                     supply = float(raw_supply)
-
             except (ValueError, TypeError):
-
                 supply = 0
-
             
-
-            # 2. 安全获取数据库市值并转为 float (备用)
-
             try:
-
                 raw_mc = token_info.get('market_cap')
-
                 if raw_mc is not None:
-
                     db_market_cap = float(raw_mc)
-
             except (ValueError, TypeError):
-
                 db_market_cap = 0
-
         # --- 修复结束 ---
 
-
-
         # 逻辑判断
-
-        # 优先逻辑：动态计算市值 (实时价格 * 流通量)
-
         if supply > 0:
-
             market_cap = supply * current_price
-
             intensity = oi_growth_usd / market_cap
-
-            
-
-        # 降级逻辑：如果有静态市值数据，使用静态数据
-
         elif db_market_cap > 0:
-
             market_cap = db_market_cap
-
             intensity = oi_growth_usd / market_cap
-
-            
-
-        # 再次降级：没有市值数据，使用 OI 基数进行估算
-
         else:
-
             if min_oi > 0: intensity = (oi_growth_tokens / min_oi) * 0.1
 
-
-
         ranking_data.append({
-
             "symbol": sym,
-
             "intensity": intensity, 
-
             "oi_growth_usd": oi_growth_usd,
-
             "market_cap": market_cap
-
         })
 
     # ==========================
-
     # 榜单指标区 (Metric Lists)
-
     # ==========================
-
     col_left, col_right = st.columns(2)
-
     
-
     # 准备数据
-
     top_intensity = []
-
     top_whales = []
-
     if ranking_data:
-
         top_intensity = sorted(ranking_data, key=lambda x: x['intensity'], reverse=True)[:10]
-
         top_whales = sorted(ranking_data, key=lambda x: x['oi_growth_usd'], reverse=True)[:10]
 
-
-
     # --- 左侧指标：Top 10 强度 ---
-
     with col_left:
-
         st.subheader("🔥 Top 10 强度榜 (相对比例)")
-
         st.caption("逻辑：(当前OI - 最低OI) * 价格 / 实时市值")
-
         st.markdown("---")
-
         for i, item in enumerate(top_intensity):
-
             st.metric(
-
                 label=f"No.{i+1} {item['symbol']}",
-
                 value=f"{item['intensity']*100:.2f}%",
-
                 delta=f"MC: ${format_number(item['market_cap'])}",
-
                 delta_color="off"
-
             )
-
             st.markdown("""<hr style="margin: 5px 0; border-top: 1px dashed #eee;">""", unsafe_allow_html=True)
-
     
-
     # --- 右侧指标：Top 10 巨鲸 ---
-
     with col_right:
-
         st.subheader("🐳 Top 10 巨鲸榜 (绝对金额)")
-
         st.caption("逻辑：(当前OI - 最低OI) * 价格。")
-
         st.markdown("---")
-
         for i, item in enumerate(top_whales):
-
             st.metric(
-
                 label=f"No.{i+1} {item['symbol']}",
-
                 value=f"+${format_number(item['oi_growth_usd'])}",
-
                 delta="资金净流入",
-
                 delta_color="normal"
-
             )
-
             st.markdown("""<hr style="margin: 5px 0; border-top: 1px dashed #eee;">""", unsafe_allow_html=True)
-
     
-
     st.markdown("---")
-
     
-
     # ==========================
-
     # 双塔图表区 (Charts) - 左右并列
-
     # ==========================
-
     
-
     chart_col_left, chart_col_right = st.columns(2)
-
     
-
-    # --- 左塔：Top 10 强度图表 ---
-
+    # --- 左塔：Top 10 强度图表 (使用 TradingView) ---
     with chart_col_left:
-
-        st.subheader("📈 强度 Top 10 走势")
-
+        st.subheader("📈 强度 Top 10 走势 (Live)")
         if top_intensity:
-
             for i, item in enumerate(top_intensity, 1):
-
-                render_chart_component(i, item['symbol'], bulk_data, ranking_data, is_top_mover=True, list_type="strength")
-
+                # 开启 use_tv=True
+                render_chart_component(i, item['symbol'], bulk_data, ranking_data, is_top_mover=True, list_type="strength", use_tv=True)
         else:
-
             st.info("暂无数据")
 
-
-
-    # --- 右塔：Top 10 巨鲸图表 ---
-
+    # --- 右塔：Top 10 巨鲸图表 (使用 TradingView) ---
     with chart_col_right:
-
-        st.subheader("📈 巨鲸 Top 10 走势")
-
+        st.subheader("📈 巨鲸 Top 10 走势 (Live)")
         if top_whales:
-
             for i, item in enumerate(top_whales, 1):
-
-                render_chart_component(i, item['symbol'], bulk_data, ranking_data, is_top_mover=True, list_type="whale")
-
+                # 开启 use_tv=True
+                render_chart_component(i, item['symbol'], bulk_data, ranking_data, is_top_mover=True, list_type="whale", use_tv=True)
         else:
-
             st.info("暂无数据")
-
     
-
     st.markdown("---")
-
     st.subheader("📋 其他合约列表 (已去重)")
 
-
-
-    # --- 底部：剩余列表 (去重) ---
-
+    # --- 底部：剩余列表 (去重) - 依然使用 Altair 节省资源 ---
     shown_symbols = set()
-
     for item in top_intensity: shown_symbols.add(item['symbol'])
-
     for item in top_whales: shown_symbols.add(item['symbol'])
-
     
-
     remaining_symbols = [s for s in target_symbols if s not in shown_symbols]
 
-
-
     for rank, symbol in enumerate(remaining_symbols, 1):
-
-        render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=False)
-
-
+        # 底部列表 use_tv 默认为 False，使用 Altair
+        render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=False, use_tv=False)
 
 if __name__ == '__main__':
-
     main_app()
