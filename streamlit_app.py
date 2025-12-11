@@ -134,7 +134,7 @@ def create_dual_axis_chart(df, symbol):
     )
     return alt.layer(line_price, line_oi).resolve_scale(y='independent').properties(height=350)
 
-# --- TradingView Widget (加载 Crypto Open Interest) ---
+# --- TradingView Widget (加载标准 OI, 白色背景, 填满容器) ---
 def render_tradingview_widget(symbol, height=380):
     container_id = f"tv_{symbol}"
     
@@ -143,6 +143,7 @@ def render_tradingview_widget(symbol, height=380):
 
     html_code = f"""
     <style>
+        /* 🌟 暴力重置 CSS，解决"没填满框框"的问题 */
         body, html {{ 
             margin: 0 !important; 
             padding: 0 !important; 
@@ -158,6 +159,7 @@ def render_tradingview_widget(symbol, height=380):
         #{container_id} {{
             height: 100% !important; 
             width: 100% !important; 
+            border: none !important;
         }}
     </style>
 
@@ -171,17 +173,20 @@ def render_tradingview_widget(symbol, height=380):
         "symbol": "{tv_symbol}",
         "interval": "15",
         "timezone": "Asia/Shanghai",
-        "theme": "light",
+        "theme": "light",          // 白色主题
         "style": "1",
         "locale": "zh_CN",
         "enable_publishing": false,
-        "hide_top_toolbar": false,
+        "hide_top_toolbar": false, // 开启工具栏，方便手动检查指标
         "hide_legend": false,
         "save_image": false,
         "container_id": "{container_id}",
         "studies": [
-            "MASimple@tv-basicstudies",     // 均线
-            "OpenInterest@tv-basicstudies"  // 这是标准Open Interest的内部ID，通常也对应"Crypto Open Interest"
+            "MASimple@tv-basicstudies",    
+            // 🌟 加载官方标准OI指标 🌟
+            // 注意：Widget不支持加载名为 "Crypto Open Interest" 的社区脚本
+            // 下面这个是唯一能在 Widget 中显示的官方 OI 数据
+            "OpenInterest@tv-basicstudies" 
         ],
         "disabled_features": [
             "header_symbol_search", 
@@ -244,6 +249,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
     with st.expander(label, expanded=True):
         st.markdown(expander_title_html, unsafe_allow_html=True)
         if use_tv:
+            # 高度调整为380，配合CSS的100%填满
             render_tradingview_widget(symbol, height=380)
         elif chart:
             st.altair_chart(chart, use_container_width=True)
