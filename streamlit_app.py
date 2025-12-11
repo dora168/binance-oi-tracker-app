@@ -1,10 +1,11 @@
 import streamlit as st
 import pandas as pd
 import altair as alt
-import pymysql
 import os
-from contextlib import contextmanager
-import streamlit.components.v1 as components  # <--- 新增引用
+import connectorx as cx
+from urllib.parse import quote_plus
+from concurrent.futures import ThreadPoolExecutor
+import streamlit.components.v1 as components
 
 # --- A. 数据库配置 ----
 
@@ -12,91 +13,98 @@ DB_HOST = os.getenv("DB_HOST") or st.secrets.get("DB_HOST", "cd-cdb-p6vea42o.sql
 DB_PORT = int(os.getenv("DB_PORT") or st.secrets.get("DB_PORT", 24197))
 DB_USER = os.getenv("DB_USER") or st.secrets.get("DB_USER", "root")
 DB_PASSWORD = os.getenv("DB_PASSWORD") or st.secrets.get("DB_PASSWORD", None)
-DB_CHARSET = 'utf8mb4'
 
 DB_NAME_OI = 'open_interest_db'
 DB_NAME_SUPPLY = 'circulating_supply'
-DATA_LIMIT = 4000
 
-# --- B. 数据库功能 ---
+DATA_LIMIT_RAW = 4000
+SAMPLE_STEP = 10 
+
+# --- B. 数据库功能 (修复 URL 报错) ---
 
 @st.cache_resource
-def get_db_connection_params(db_name):
+def get_db_uri(db_name):
+    """构建 connectorx 需要的连接字符串"""
     if not DB_PASSWORD:
         st.error("❌ 数据库密码未配置。")
         st.stop()
-    return {
-        'host': DB_HOST,
-        'port': DB_PORT,
-        'user': DB_USER,
-        'password': DB_PASSWORD,
-        'db': db_name,
-        'charset': DB_CHARSET,
-        'autocommit': True,
-        'connect_timeout': 10
-    }
+    
+    safe_pwd = quote_plus(DB_PASSWORD)
+    
+    # ⚠️ 修复点：绝对不要加 ?charset=utf8mb4，Rust 引擎不认这个参数
+    return f"mysql://{DB_USER}:{safe_pwd}@{DB_HOST}:{DB_PORT}/{db_name}"
 
-@contextmanager
-def get_connection(db_name):
-    params = get_db_connection_params(db_name)
-    conn = pymysql.connect(**params)
+def _fetch_supply_worker():
+    """线程任务1：获取流通量"""
     try:
-        yield conn
-    finally:
-        conn.close()
-
-@st.cache_data(ttl=300) # 流通量不常变，缓存久一点
-def fetch_circulating_supply():
-    try:
-        with get_connection(DB_NAME_SUPPLY) as conn:
-            # 表名: binance_circulating_supply
-            sql = f"SELECT symbol, circulating_supply, market_cap FROM `binance_circulating_supply`"
-            df = pd.read_sql(sql, conn)
-            return df.set_index('symbol').to_dict('index')
+        uri = get_db_uri(DB_NAME_SUPPLY)
+        # 确保表名正确，这里假设是 binance_circulating_supply
+        query = f"SELECT symbol, circulating_supply, market_cap FROM `binance_circulating_supply`"
+        df = cx.read_sql(uri, query)
+        return df.set_index('symbol').to_dict('index')
     except Exception as e:
-        print(f"⚠️ 流通量数据读取失败: {e}")
+        print(f"⚠️ 流通量读取失败: {e}")
         return {}
 
-@st.cache_data(ttl=60)
-def get_sorted_symbols_by_oi_usd():
-    try:
-        with get_connection(DB_NAME_OI) as conn:
-            # 表名: binance
-            sql = f"SELECT symbol FROM `binance` GROUP BY symbol ORDER BY MAX(oi_usd) DESC;"
-            df = pd.read_sql(sql, conn)
-            return df['symbol'].tolist()
-    except Exception as e:
-        st.error(f"❌ 列表获取失败: {e}")
-        return []
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_bulk_data_one_shot(symbol_list):
-    if not symbol_list: return {}
-    placeholders = ', '.join(['%s'] * len(symbol_list))
+def _fetch_market_data_worker(limit=150):
+    """线程任务2：获取K线数据"""
+    uri = get_db_uri(DB_NAME_OI)
     
-    # 表名: binance
+    # 1. 先拿列表
+    try:
+        list_query = "SELECT symbol FROM `binance` GROUP BY symbol ORDER BY MAX(oi_usd) DESC LIMIT 200"
+        df_list = cx.read_sql(uri, list_query)
+        sorted_symbols = df_list['symbol'].tolist()
+    except Exception as e:
+        return {}, []
+
+    if not sorted_symbols: return {}, []
+    
+    target_symbols = sorted_symbols[:limit]
+    symbols_str = "', '".join(target_symbols)
+    
+    # 2. 再拿详情 (SQL降采样优化)
     sql_query = f"""
     WITH RankedData AS (
         SELECT symbol, `time`, `price`, `oi`,
         ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY `time` DESC) as rn
         FROM `binance`
-        WHERE symbol IN ({placeholders})
+        WHERE symbol IN ('{symbols_str}')
     )
     SELECT symbol, `time`, `price` AS `标记价格 (USDC)`, `oi` AS `未平仓量`
     FROM RankedData
-    WHERE rn <= %s
+    WHERE rn <= {DATA_LIMIT_RAW} 
+    AND (rn = 1 OR rn % {SAMPLE_STEP} = 0)
     ORDER BY symbol, `time` ASC;
     """
     
     try:
-        with get_connection(DB_NAME_OI) as conn:
-            df_all = pd.read_sql(sql_query, conn, params=tuple(symbol_list) + (DATA_LIMIT,))
+        df_all = cx.read_sql(uri, sql_query)
+        if df_all.empty: return {}, target_symbols
         
-        if df_all.empty: return {}
-        return {sym: group for sym, group in df_all.groupby('symbol')}
+        # 格式修正
+        if not pd.api.types.is_datetime64_any_dtype(df_all['time']):
+            df_all['time'] = pd.to_datetime(df_all['time'])
+            
+        df_all['标记价格 (USDC)'] = df_all['标记价格 (USDC)'].astype(float)
+        df_all['未平仓量'] = df_all['未平仓量'].astype(float)
+
+        return {sym: group for sym, group in df_all.groupby('symbol')}, target_symbols
     except Exception as e:
-        st.error(f"⚠️ 数据查询失败: {e}")
-        return {}
+        print(f"⚠️ 市场数据读取失败: {e}")
+        return {}, target_symbols
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_all_data_concurrently():
+    """并发入口"""
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_supply = executor.submit(_fetch_supply_worker)
+        future_market = executor.submit(_fetch_market_data_worker, 150)
+        
+        supply_data = future_supply.result()
+        bulk_data, target_symbols = future_market.result()
+        
+    return supply_data, bulk_data, target_symbols
 
 # --- C. 辅助与绘图 ---
 
@@ -106,13 +114,10 @@ def format_number(num):
     elif abs(num) >= 1_000: return f"{num / 1_000:.1f}K"
     else: return f"{num:.0f}"
 
-def downsample_data(df, target_points=400):
-    if len(df) <= target_points: return df
+def downsample_data(df, target_points=200):
+    if len(df) <= target_points * 1.5: return df
     step = len(df) // target_points
-    df_sampled = df.iloc[::step].copy()
-    if df.index[-1] not in df_sampled.index:
-        df_sampled = pd.concat([df_sampled, df.iloc[[-1]]])
-    return df_sampled
+    return df.iloc[::step]
 
 axis_format_logic = """
 datum.value >= 1000000000 ? format(datum.value / 1000000000, ',.2f') + 'B' : 
@@ -123,37 +128,25 @@ format(datum.value, ',.0f')
 
 def create_dual_axis_chart(df, symbol):
     if df.empty: return None
-    if not pd.api.types.is_datetime64_any_dtype(df['time']):
-        df['time'] = pd.to_datetime(df['time'])
-    df = df.reset_index(drop=True)
-    df['index'] = df.index
-    tooltip_fields = [
-        alt.Tooltip('time', title='时间', format="%m-%d %H:%M"),
-        alt.Tooltip('标记价格 (USDC)', title='价格', format='$,.4f'),
-        alt.Tooltip('未平仓量', title='OI', format=',.0f') 
-    ]
-    base = alt.Chart(df).encode(alt.X('index', title=None, axis=alt.Axis(labels=False)))
+    # 极简绘图模式
+    base = alt.Chart(df).encode(alt.X('time', axis=alt.Axis(labels=False, title=None)))
     line_price = base.mark_line(color='#d62728', strokeWidth=2).encode(
         alt.Y('标记价格 (USDC)', axis=alt.Axis(title='', titleColor='#d62728', orient='right'), scale=alt.Scale(zero=False))
     )
     line_oi = base.mark_line(color='purple', strokeWidth=2).encode(
         alt.Y('未平仓量', axis=alt.Axis(title='OI', titleColor='purple', orient='right', offset=45, labelExpr=axis_format_logic), scale=alt.Scale(zero=False))
     )
-    chart = alt.layer(line_price, line_oi).resolve_scale(y='independent').encode(
-        tooltip=tooltip_fields
-    ).properties(height=450)
-    return chart
+    return alt.layer(line_price, line_oi).resolve_scale(y='independent').properties(height=350)
 
-# --- 新增: TradingView Widget 渲染函数 ---
+# --- TradingView Widget (修复 Invalid Symbol) ---
 def render_tradingview_widget(symbol, height=400):
-    """
-    渲染 TradingView Widget。
-    优点：不消耗服务器流量，交互性好。
-    注意：不要在一个页面渲染超过20个，否则浏览器会卡。
-    """
     container_id = f"tv_{symbol}"
-    # 构造币安合约 Symbol，例如 BINANCE:BTCUSDT.P
-    tv_symbol = f"BINANCE:{symbol}USDT.P"
+    
+    # ⚠️ 修复点：自动清洗 Symbol
+    # 如果数据库里是 "BTCUSDT"，去掉 "USDT" 变成 "BTC"，然后再拼接
+    clean_symbol = symbol.upper().replace("USDT", "")
+    # 拼接成 Binance 合约格式: BINANCE:BTCUSDT.P
+    tv_symbol = f"BINANCE:{clean_symbol}USDT.P"
 
     html_code = f"""
     <div class="tradingview-widget-container" style="height:100%;width:100%">
@@ -184,13 +177,7 @@ def render_tradingview_widget(symbol, height=400):
     components.html(html_code, height=height)
 
 def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=False, list_type="", use_tv=False):
-    """
-    渲染单个图表组件
-    use_tv: 是否使用 TradingView 替代 Altair (建议只对 Top 10 使用)
-    """
     raw_df = bulk_data.get(symbol)
-    
-    # Coinglass 链接改为 Binance
     coinglass_url = f"https://www.coinglass.com/tv/zh/Binance_{symbol}USDT"
     
     title_color = "black"
@@ -198,11 +185,10 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
     info_html = ""
     
     if raw_df is not None and not raw_df.empty:
-        start_p = raw_df['标记价格 (USDC)'].iloc[0]
-        end_p = raw_df['标记价格 (USDC)'].iloc[-1]
+        p_vals = raw_df['标记价格 (USDC)'].values
+        start_p, end_p = p_vals[0], p_vals[-1]
         title_color = "#009900" if end_p >= start_p else "#D10000"
         
-        # 获取统计信息
         item_stats = next((item for item in ranking_data if item["symbol"] == symbol), None)
         if item_stats:
             int_val = item_stats['intensity'] * 100
@@ -218,12 +204,10 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
                 f'</span>'
             )
         
-        # 只有当不使用 TradingView 时，才计算 Altair 图表
         if not use_tv:
             chart_df = downsample_data(raw_df, target_points=400)
             chart = create_dual_axis_chart(chart_df, symbol)
 
-    # 标题生成
     fire_icon = "🔥" if list_type == "strength" else ("🐳" if list_type == "whale" else "")
     expander_title_html = (
         f'<div style="text-align: center; margin-bottom: 5px;">'
@@ -235,20 +219,13 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
         f'</div>'
     )
     
-    if is_top_mover:
-        label = f"{fire_icon} {symbol}"
-    else:
-        label = f"#{rank} {symbol}"
+    label = f"{fire_icon} {symbol}" if is_top_mover else f"#{rank} {symbol}"
 
-    # 这里的 expanded=True 配合 use_container_width=True 会自动适应左右分栏的宽度
     with st.expander(label, expanded=True):
         st.markdown(expander_title_html, unsafe_allow_html=True)
-        
         if use_tv:
-            # 使用 TradingView
             render_tradingview_widget(symbol, height=350)
         elif chart:
-            # 使用 Altair (Python 画图)
             st.altair_chart(chart, use_container_width=True)
         else:
             st.info("暂无数据")
@@ -259,22 +236,13 @@ def main_app():
     st.set_page_config(layout="wide", page_title="Binance OI Dashboard")
     st.title("⚡ Binance OI 双塔监控 (TradingView 集成版)")
     
-    with st.spinner("正在读取流通量数据库..."):
-        supply_data = fetch_circulating_supply()
-        
-    with st.spinner("正在加载市场数据..."):
-        sorted_symbols = get_sorted_symbols_by_oi_usd()
-        if not sorted_symbols: st.stop()
-        
-        # 监控前150个合约
-        target_symbols = sorted_symbols[:150]
-        
-        bulk_data = fetch_bulk_data_one_shot(target_symbols)
+    with st.spinner("🚀 极速加载中 (Rust引擎 + 多线程并发)..."):
+        supply_data, bulk_data, target_symbols = fetch_all_data_concurrently()
 
     if not bulk_data:
         st.warning("暂无数据"); st.stop()
 
-    # --- 计算统计数据 (修复版) ---
+    # --- 计算逻辑 ---
     ranking_data = []
     for sym, df in bulk_data.items():
         if df.empty or len(df) < 2: continue
@@ -284,33 +252,20 @@ def main_app():
         
         min_oi = df['未平仓量'].min()
         current_oi = df['未平仓量'].iloc[-1]
-        oi_growth_tokens = current_oi - min_oi
-        oi_growth_usd = oi_growth_tokens * current_price
+        oi_growth_usd = (current_oi - min_oi) * current_price
         
-        intensity = 0
+        # --- 修复后的市值计算 ---
         market_cap = 0
-        
-        # --- 修复开始：安全的数据类型转换 ---
         supply = 0
         db_market_cap = 0
         
         if token_info:
-            try:
-                raw_supply = token_info.get('circulating_supply')
-                if raw_supply is not None:
-                    supply = float(raw_supply)
-            except (ValueError, TypeError):
-                supply = 0
-            
-            try:
-                raw_mc = token_info.get('market_cap')
-                if raw_mc is not None:
-                    db_market_cap = float(raw_mc)
-            except (ValueError, TypeError):
-                db_market_cap = 0
-        # --- 修复结束 ---
+            try: supply = float(token_info.get('circulating_supply') or 0)
+            except: pass
+            try: db_market_cap = float(token_info.get('market_cap') or 0)
+            except: pass
 
-        # 逻辑判断
+        intensity = 0
         if supply > 0:
             market_cap = supply * current_price
             intensity = oi_growth_usd / market_cap
@@ -318,6 +273,7 @@ def main_app():
             market_cap = db_market_cap
             intensity = oi_growth_usd / market_cap
         else:
+            oi_growth_tokens = current_oi - min_oi
             if min_oi > 0: intensity = (oi_growth_tokens / min_oi) * 0.1
 
         ranking_data.append({
@@ -327,86 +283,52 @@ def main_app():
             "market_cap": market_cap
         })
 
-    # ==========================
-    # 榜单指标区 (Metric Lists)
-    # ==========================
+    # --- 渲染逻辑 ---
     col_left, col_right = st.columns(2)
     
-    # 准备数据
-    top_intensity = []
-    top_whales = []
-    if ranking_data:
-        top_intensity = sorted(ranking_data, key=lambda x: x['intensity'], reverse=True)[:10]
-        top_whales = sorted(ranking_data, key=lambda x: x['oi_growth_usd'], reverse=True)[:10]
+    ranking_data.sort(key=lambda x: x['intensity'], reverse=True)
+    top_intensity = ranking_data[:10]
+    
+    ranking_data.sort(key=lambda x: x['oi_growth_usd'], reverse=True)
+    top_whales = ranking_data[:10]
 
-    # --- 左侧指标：Top 10 强度 ---
     with col_left:
-        st.subheader("🔥 Top 10 强度榜 (相对比例)")
-        st.caption("逻辑：(当前OI - 最低OI) * 价格 / 实时市值")
+        st.subheader("🔥 Top 10 强度榜")
         st.markdown("---")
         for i, item in enumerate(top_intensity):
-            st.metric(
-                label=f"No.{i+1} {item['symbol']}",
-                value=f"{item['intensity']*100:.2f}%",
-                delta=f"MC: ${format_number(item['market_cap'])}",
-                delta_color="off"
-            )
-            st.markdown("""<hr style="margin: 5px 0; border-top: 1px dashed #eee;">""", unsafe_allow_html=True)
-    
-    # --- 右侧指标：Top 10 巨鲸 ---
+            st.metric(f"No.{i+1} {item['symbol']}", f"{item['intensity']*100:.2f}%", f"MC: ${format_number(item['market_cap'])}", delta_color="off")
+            st.markdown("""<hr style="margin: 2px 0;">""", unsafe_allow_html=True)
+            
     with col_right:
-        st.subheader("🐳 Top 10 巨鲸榜 (绝对金额)")
-        st.caption("逻辑：(当前OI - 最低OI) * 价格。")
+        st.subheader("🐳 Top 10 巨鲸榜")
         st.markdown("---")
         for i, item in enumerate(top_whales):
-            st.metric(
-                label=f"No.{i+1} {item['symbol']}",
-                value=f"+${format_number(item['oi_growth_usd'])}",
-                delta="资金净流入",
-                delta_color="normal"
-            )
-            st.markdown("""<hr style="margin: 5px 0; border-top: 1px dashed #eee;">""", unsafe_allow_html=True)
+            st.metric(f"No.{i+1} {item['symbol']}", f"+${format_number(item['oi_growth_usd'])}", "资金净流入")
+            st.markdown("""<hr style="margin: 2px 0;">""", unsafe_allow_html=True)
     
     st.markdown("---")
     
-    # ==========================
-    # 双塔图表区 (Charts) - 左右并列
-    # ==========================
-    
-    chart_col_left, chart_col_right = st.columns(2)
-    
-    # --- 左塔：Top 10 强度图表 (使用 TradingView) ---
-    with chart_col_left:
-        st.subheader("📈 强度 Top 10 走势 (Live)")
-        if top_intensity:
-            for i, item in enumerate(top_intensity, 1):
-                # 开启 use_tv=True
-                render_chart_component(i, item['symbol'], bulk_data, ranking_data, is_top_mover=True, list_type="strength", use_tv=True)
-        else:
-            st.info("暂无数据")
+    # 图表区 (启用 TradingView)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("📈 强度 Top 10 (Live)")
+        for i, item in enumerate(top_intensity, 1):
+            render_chart_component(i, item['symbol'], bulk_data, ranking_data, True, "strength", use_tv=True)
+            
+    with c2:
+        st.subheader("📈 巨鲸 Top 10 (Live)")
+        for i, item in enumerate(top_whales, 1):
+            render_chart_component(i, item['symbol'], bulk_data, ranking_data, True, "whale", use_tv=True)
 
-    # --- 右塔：Top 10 巨鲸图表 (使用 TradingView) ---
-    with chart_col_right:
-        st.subheader("📈 巨鲸 Top 10 走势 (Live)")
-        if top_whales:
-            for i, item in enumerate(top_whales, 1):
-                # 开启 use_tv=True
-                render_chart_component(i, item['symbol'], bulk_data, ranking_data, is_top_mover=True, list_type="whale", use_tv=True)
-        else:
-            st.info("暂无数据")
-    
     st.markdown("---")
-    st.subheader("📋 其他合约列表 (已去重)")
+    st.subheader("📋 其他合约列表")
 
-    # --- 底部：剩余列表 (去重) - 依然使用 Altair 节省资源 ---
-    shown_symbols = set()
-    for item in top_intensity: shown_symbols.add(item['symbol'])
-    for item in top_whales: shown_symbols.add(item['symbol'])
-    
-    remaining_symbols = [s for s in target_symbols if s not in shown_symbols]
+    # 底部仅用表格，防止卡顿
+    shown = {i['symbol'] for i in top_intensity} | {i['symbol'] for i in top_whales}
+    remaining = [s for s in target_symbols if s not in shown]
 
-    for rank, symbol in enumerate(remaining_symbols, 1):
-        # 底部列表 use_tv 默认为 False，使用 Altair
+    for rank, symbol in enumerate(remaining, 1):
+         # 底部列表 use_tv 默认为 False，使用 Altair
         render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=False, use_tv=False)
 
 if __name__ == '__main__':
