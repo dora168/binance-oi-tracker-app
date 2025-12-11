@@ -30,15 +30,13 @@ def get_db_uri(db_name):
         st.stop()
     
     safe_pwd = quote_plus(DB_PASSWORD)
-    
-    # ⚠️ 关键修复：绝对不要加 ?charset=utf8mb4，Rust 引擎不认这个参数
+    # ⚠️ 关键修复：绝对不要加 ?charset=utf8mb4
     return f"mysql://{DB_USER}:{safe_pwd}@{DB_HOST}:{DB_PORT}/{db_name}"
 
 def _fetch_supply_worker():
     """线程任务1：获取流通量"""
     try:
         uri = get_db_uri(DB_NAME_SUPPLY)
-        # 确保表名正确
         query = f"SELECT symbol, circulating_supply, market_cap FROM `binance_circulating_supply`"
         df = cx.read_sql(uri, query)
         return df.set_index('symbol').to_dict('index')
@@ -82,7 +80,6 @@ def _fetch_market_data_worker(limit=150):
         df_all = cx.read_sql(uri, sql_query)
         if df_all.empty: return {}, target_symbols
         
-        # 格式修正
         if not pd.api.types.is_datetime64_any_dtype(df_all['time']):
             df_all['time'] = pd.to_datetime(df_all['time'])
             
@@ -128,7 +125,6 @@ format(datum.value, ',.0f')
 
 def create_dual_axis_chart(df, symbol):
     if df.empty: return None
-    # 极简绘图模式
     base = alt.Chart(df).encode(alt.X('time', axis=alt.Axis(labels=False, title=None)))
     line_price = base.mark_line(color='#d62728', strokeWidth=2).encode(
         alt.Y('标记价格 (USDC)', axis=alt.Axis(title='', titleColor='#d62728', orient='right'), scale=alt.Scale(zero=False))
@@ -138,12 +134,10 @@ def create_dual_axis_chart(df, symbol):
     )
     return alt.layer(line_price, line_oi).resolve_scale(y='independent').properties(height=350)
 
-# --- TradingView Widget (最终修复版：填满容器 + 去除白边 + Symbol清洗) ---
+# --- TradingView Widget (白色背景版) ---
 def render_tradingview_widget(symbol, height=380):
     container_id = f"tv_{symbol}"
     
-    # 1. 清洗 Symbol：防止出现 ETHUSDTUSDT 的情况
-    # 逻辑：先统一转大写，把已有的 USDT 后缀去掉，最后统一加上 USDT.P (币安永续合约)
     clean_symbol = symbol.upper().replace("USDT", "")
     tv_symbol = f"BINANCE:{clean_symbol}USDT.P"
 
@@ -155,7 +149,7 @@ def render_tradingview_widget(symbol, height=380):
             height: 100% !important; 
             width: 100% !important; 
             overflow: hidden !important;
-            background-color: #131722; /* 和 TradingView 深色背景一致，防止加载时闪白屏 */
+            background-color: #ffffff; /* 🌟 1. 改为白色背景，防止加载时闪烁 */
         }}
         .tradingview-widget-container {{ 
             height: 100% !important; 
@@ -177,7 +171,7 @@ def render_tradingview_widget(symbol, height=380):
         "symbol": "{tv_symbol}",
         "interval": "15",
         "timezone": "Asia/Shanghai",
-        "theme": "dark",
+        "theme": "light",          // 🌟 2. 主题改为 light
         "style": "1",
         "locale": "zh_CN",
         "enable_publishing": false,
@@ -197,7 +191,6 @@ def render_tradingview_widget(symbol, height=380):
       </script>
     </div>
     """
-    # scrolling=False 是防止滚动条的关键
     components.html(html_code, height=height, scrolling=False)
 
 def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=False, list_type="", use_tv=False):
@@ -228,7 +221,6 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
                 f'</span>'
             )
         
-        # 只有不用TV时才计算Altair图表
         if not use_tv:
             chart_df = downsample_data(raw_df, target_points=400)
             chart = create_dual_axis_chart(chart_df, symbol)
@@ -259,7 +251,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
 
 def main_app():
     st.set_page_config(layout="wide", page_title="Binance OI Dashboard")
-    st.title("⚡ Binance OI 双塔监控 (TradingView 集成版)")
+    st.title("⚡ Binance OI 双塔监控 (TradingView 白色版)")
     
     with st.spinner("🚀 极速加载中 (Rust引擎 + 多线程并发)..."):
         supply_data, bulk_data, target_symbols = fetch_all_data_concurrently()
@@ -267,7 +259,6 @@ def main_app():
     if not bulk_data:
         st.warning("暂无数据"); st.stop()
 
-    # --- 计算逻辑 ---
     ranking_data = []
     for sym, df in bulk_data.items():
         if df.empty or len(df) < 2: continue
@@ -279,7 +270,6 @@ def main_app():
         current_oi = df['未平仓量'].iloc[-1]
         oi_growth_usd = (current_oi - min_oi) * current_price
         
-        # --- 市值计算 ---
         market_cap = 0
         supply = 0
         db_market_cap = 0
@@ -308,7 +298,6 @@ def main_app():
             "market_cap": market_cap
         })
 
-    # --- 渲染逻辑 ---
     col_left, col_right = st.columns(2)
     
     ranking_data.sort(key=lambda x: x['intensity'], reverse=True)
@@ -333,12 +322,10 @@ def main_app():
     
     st.markdown("---")
     
-    # 图表区 (启用 TradingView)
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("📈 强度 Top 10 (Live)")
         for i, item in enumerate(top_intensity, 1):
-            # 这里的 Top 10 使用 TradingView
             render_chart_component(i, item['symbol'], bulk_data, ranking_data, True, "strength", use_tv=True)
             
     with c2:
@@ -349,12 +336,10 @@ def main_app():
     st.markdown("---")
     st.subheader("📋 其他合约列表")
 
-    # 底部列表使用 Altair，避免浏览器卡顿
     shown = {i['symbol'] for i in top_intensity} | {i['symbol'] for i in top_whales}
     remaining = [s for s in target_symbols if s not in shown]
 
     for rank, symbol in enumerate(remaining, 1):
-         # use_tv 默认为 False
         render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=False, use_tv=False)
 
 if __name__ == '__main__':
