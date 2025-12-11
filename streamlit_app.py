@@ -54,7 +54,7 @@ def _fetch_market_data_worker(limit=150):
     target_symbols = sorted_symbols[:limit]
     symbols_str = "', '".join(target_symbols)
     
-    # SQL 降采样优化
+    # 依然保留SQL逻辑用于计算强度榜单，但不再用于画图
     sql_query = f"""
     WITH RankedData AS (
         SELECT symbol, `time`, `price`, `oi`,
@@ -109,29 +109,23 @@ datum.value >= 1000 ? format(datum.value / 1000, ',.1f') + 'K' :
 format(datum.value, ',.0f')
 """
 
-# ⚡ 备用方案：专门画 OI 的扁平图表
-def create_oi_only_chart(df):
+# 用于底部列表的 Altair 图 (TradingView太重，底部列表依然用轻量级Altair)
+def create_dual_axis_chart(df, symbol):
     if df.empty: return None
-    base = alt.Chart(df).encode(alt.X('time', axis=alt.Axis(labels=False, title=None, grid=False)))
-    
-    line_oi = base.mark_area(
-        line={'color':'purple'}, 
-        color=alt.Gradient(
-            gradient='linear',
-            stops=[alt.GradientStop(color='purple', offset=0),
-                   alt.GradientStop(color='white', offset=1)],
-            x1=1, x2=1, y1=1, y2=0
-        )
-    ).encode(
-        alt.Y('未平仓量', axis=alt.Axis(title='Open Interest', titleColor='purple', orient='right', tickCount=3, labelExpr=axis_format_logic), scale=alt.Scale(zero=False)),
-        tooltip=[alt.Tooltip('time', format="%H:%M"), alt.Tooltip('未平仓量', format=',.0f')]
-    ).properties(height=100) # 高度设小一点，紧贴上方
-    
-    return line_oi
+    base = alt.Chart(df).encode(alt.X('time', axis=alt.Axis(labels=False, title=None)))
+    line_price = base.mark_line(color='#d62728', strokeWidth=2).encode(
+        alt.Y('标记价格 (USDC)', axis=alt.Axis(title='', titleColor='#d62728', orient='right'), scale=alt.Scale(zero=False))
+    )
+    line_oi = base.mark_line(color='purple', strokeWidth=2).encode(
+        alt.Y('未平仓量', axis=alt.Axis(title='OI', titleColor='purple', orient='right', offset=45, labelExpr=axis_format_logic), scale=alt.Scale(zero=False))
+    )
+    return alt.layer(line_price, line_oi).resolve_scale(y='independent').properties(height=350)
 
-# --- TradingView Widget (指定 ID 版) ---
-def render_tradingview_widget(symbol, height=350):
+# --- TradingView Widget (纯净版：带Crypto OI) ---
+def render_tradingview_widget(symbol, height=450):
     container_id = f"tv_{symbol}"
+    
+    # 清洗逻辑：NIGHTUSDT -> NIGHT -> BINANCE:NIGHTUSDT.P
     clean_symbol = symbol.upper().replace("USDT", "")
     tv_symbol = f"BINANCE:{clean_symbol}USDT.P"
 
@@ -160,8 +154,8 @@ def render_tradingview_widget(symbol, height=350):
         "save_image": false,
         "container_id": "{container_id}",
         "studies": [
-            "MASimple@tv-basicstudies",     // 均线
-            "OpenInterest@tv-basicstudies"  // 🌟 这里就是你要的固定内部ID
+            "MASimple@tv-basicstudies",      // 均线
+            "OpenInterest@tv-basicstudies"   // 🌟 对应你的 Crypto Open Interest
         ],
         "disabled_features": ["header_symbol_search", "header_compare", "use_localstorage_for_settings", "display_market_status"]
       }}
@@ -175,7 +169,6 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
     raw_df = bulk_data.get(symbol)
     coinglass_url = f"https://www.coinglass.com/tv/zh/Binance_{symbol}USDT"
     title_color = "black"
-    chart_oi = None 
     info_html = ""
     
     if raw_df is not None and not raw_df.empty:
@@ -197,10 +190,6 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
                 f'增量:<span style="color: #009900; font-weight: bold;">+${growth_str}</span>'
                 f'</span>'
             )
-        
-        # 准备本地 OI 数据
-        chart_df = downsample_data(raw_df, target_points=400)
-        chart_oi = create_oi_only_chart(chart_df)
 
     fire_icon = "🔥" if list_type == "strength" else ("🐳" if list_type == "whale" else "")
     expander_title_html = (
@@ -217,22 +206,19 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
 
     with st.expander(label, expanded=True):
         st.markdown(expander_title_html, unsafe_allow_html=True)
+        
         if use_tv:
-            # 1. 渲染 TradingView (带你指定的ID)
-            render_tradingview_widget(symbol, height=350)
+            # 🌟 只渲染 TradingView，没有任何本地备份图
+            render_tradingview_widget(symbol, height=450)
             
-            # 2. 渲染本地数据库 OI 图 (防止TV没数据)
-            if chart_oi:
-                st.caption("📉 链上真实 OI (Backup Data)")
-                st.altair_chart(chart_oi, use_container_width=True)
-                
         elif raw_df is not None:
-             # 双轴图逻辑 (use_tv=False 时回退)
-             base = alt.Chart(chart_df).encode(alt.X('time', axis=alt.Axis(labels=False)))
-             l_price = base.mark_line(color='#d62728').encode(alt.Y('标记价格 (USDC)', scale=alt.Scale(zero=False), axis=alt.Axis(labels=False)))
-             l_oi = base.mark_line(color='purple').encode(alt.Y('未平仓量', scale=alt.Scale(zero=False), axis=alt.Axis(title='OI', orient='right', labelExpr=axis_format_logic)))
-             st.altair_chart((l_price + l_oi).resolve_scale(y='independent').properties(height=350), use_container_width=True)
-             
+             # 底部非 Top10 列表依然使用轻量级 Altair
+             chart_df = downsample_data(raw_df, target_points=400)
+             chart = create_dual_axis_chart(chart_df, symbol)
+             if chart:
+                 st.altair_chart(chart, use_container_width=True)
+             else:
+                 st.info("暂无数据")
         else:
             st.info("暂无数据")
 
@@ -240,7 +226,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
 
 def main_app():
     st.set_page_config(layout="wide", page_title="Binance OI Dashboard")
-    st.title("⚡ Binance OI 双塔监控 (Final Version)")
+    st.title("⚡ Binance OI 双塔监控 (Crypto OI Edition)")
     
     with st.spinner("🚀 极速加载中..."):
         supply_data, bulk_data, target_symbols = fetch_all_data_concurrently()
