@@ -20,7 +20,7 @@ DB_NAME_SUPPLY = 'circulating_supply'
 DATA_LIMIT_RAW = 4000
 SAMPLE_STEP = 10 
 
-# --- B. 数据库功能 (修复版) ---
+# --- B. 数据库功能 (Rust加速 + 修复URL) ---
 
 @st.cache_resource
 def get_db_uri(db_name):
@@ -30,7 +30,7 @@ def get_db_uri(db_name):
         st.stop()
     
     safe_pwd = quote_plus(DB_PASSWORD)
-    # ⚠️ 关键修复：绝对不要加 ?charset=utf8mb4
+    # ⚠️ 关键修复：不包含 charset 参数
     return f"mysql://{DB_USER}:{safe_pwd}@{DB_HOST}:{DB_PORT}/{db_name}"
 
 def _fetch_supply_worker():
@@ -134,7 +134,7 @@ def create_dual_axis_chart(df, symbol):
     )
     return alt.layer(line_price, line_oi).resolve_scale(y='independent').properties(height=350)
 
-# --- TradingView Widget (白色背景版) ---
+# --- TradingView Widget (加载 Crypto Open Interest) ---
 def render_tradingview_widget(symbol, height=380):
     container_id = f"tv_{symbol}"
     
@@ -149,7 +149,7 @@ def render_tradingview_widget(symbol, height=380):
             height: 100% !important; 
             width: 100% !important; 
             overflow: hidden !important;
-            background-color: #ffffff; /* 🌟 1. 改为白色背景，防止加载时闪烁 */
+            background-color: #ffffff;
         }}
         .tradingview-widget-container {{ 
             height: 100% !important; 
@@ -171,15 +171,18 @@ def render_tradingview_widget(symbol, height=380):
         "symbol": "{tv_symbol}",
         "interval": "15",
         "timezone": "Asia/Shanghai",
-        "theme": "light",          // 🌟 2. 主题改为 light
+        "theme": "light",
         "style": "1",
         "locale": "zh_CN",
         "enable_publishing": false,
-        "hide_top_toolbar": false,     
-        "hide_legend": false,          
+        "hide_top_toolbar": false,
+        "hide_legend": false,
         "save_image": false,
         "container_id": "{container_id}",
-        "studies": ["MASimple@tv-basicstudies"],
+        "studies": [
+            "MASimple@tv-basicstudies",     // 均线
+            "OpenInterest@tv-basicstudies"  // 这是标准Open Interest的内部ID，通常也对应"Crypto Open Interest"
+        ],
         "disabled_features": [
             "header_symbol_search", 
             "header_compare", 
@@ -251,7 +254,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
 
 def main_app():
     st.set_page_config(layout="wide", page_title="Binance OI Dashboard")
-    st.title("⚡ Binance OI 双塔监控 (TradingView 白色版)")
+    st.title("⚡ Binance OI 双塔监控 (TradingView + OI指标)")
     
     with st.spinner("🚀 极速加载中 (Rust引擎 + 多线程并发)..."):
         supply_data, bulk_data, target_symbols = fetch_all_data_concurrently()
