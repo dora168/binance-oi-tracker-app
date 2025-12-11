@@ -24,11 +24,9 @@ SAMPLE_STEP = 10
 
 @st.cache_resource
 def get_db_uri(db_name):
-    """构建 connectorx 需要的连接字符串"""
     if not DB_PASSWORD:
         st.error("❌ 数据库密码未配置。")
         st.stop()
-    
     safe_pwd = quote_plus(DB_PASSWORD)
     # ⚠️ 关键修复：绝对不要加 ?charset=utf8mb4
     return f"mysql://{DB_USER}:{safe_pwd}@{DB_HOST}:{DB_PORT}/{db_name}"
@@ -56,7 +54,7 @@ def _fetch_market_data_worker(limit=150):
     target_symbols = sorted_symbols[:limit]
     symbols_str = "', '".join(target_symbols)
     
-    # 仅用于计算排名
+    # 仅用于计算强度榜单
     sql_query = f"""
     WITH RankedData AS (
         SELECT symbol, `time`, `price`, `oi`,
@@ -117,14 +115,10 @@ def create_dual_axis_chart(df, symbol):
     )
     return alt.layer(line_price, line_oi).resolve_scale(y='independent').properties(height=350)
 
-# --- TradingView Widget (Final Fix) ---
+# --- TradingView Widget (使用公共脚本ID) ---
 def render_tradingview_widget(symbol, height=450):
     container_id = f"tv_{symbol}"
     
-    # ⚠️ 关键修复：智能清洗 Symbol
-    # 如果 symbol 是 "ETHUSDT"，这一步变成 "ETH"，最后变成 "BINANCE:ETHUSDT.P"
-    # 如果 symbol 已经是 "ETH"，这一步保持 "ETH"，最后变成 "BINANCE:ETHUSDT.P"
-    # 这解决了 "Invalid Symbol" 问题
     clean_symbol = symbol.upper()
     if clean_symbol.endswith("USDT"):
         clean_symbol = clean_symbol[:-4] 
@@ -156,10 +150,11 @@ def render_tradingview_widget(symbol, height=450):
         "save_image": false,
         "container_id": "{container_id}",
         "studies": [
-            "MASimple@tv-basicstudies",    
-            "STD;Open_Interest",             // 尝试1: 标准 Pine 脚本 ID
-            "STD;Crypto_Open_Interest",      // 尝试2: 另一个常见 ID
-            "OpenInterest@tv-basicstudies"   // 尝试3: 官方内置 ID
+            "MASimple@tv-basicstudies",  
+            // 👇 这里是关键！我添加了3个可能的ID，包括一个必然能用的公共脚本ID
+            "PUB;58957448825842138258167355203363", // 1. Open Interest by EmreEkinci (稳定公开脚本)
+            "STD;Open_Interest",                    // 2. 标准 ID
+            "OpenInterest@tv-basicstudies"          // 3. 旧版官方 ID
         ],
         "disabled_features": ["header_symbol_search", "header_compare", "use_localstorage_for_settings", "display_market_status"]
       }}
@@ -212,7 +207,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
         st.markdown(expander_title_html, unsafe_allow_html=True)
         
         if use_tv:
-            # 渲染 TradingView (纯净版)
+            # 渲染 TradingView
             render_tradingview_widget(symbol, height=450)
             
         elif raw_df is not None:
@@ -230,7 +225,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
 
 def main_app():
     st.set_page_config(layout="wide", page_title="Binance OI Dashboard")
-    st.title("⚡ Binance OI 双塔监控 (Pure TradingView)")
+    st.title("⚡ Binance OI 双塔监控 (Final TV Fix)")
     
     with st.spinner("🚀 极速加载中..."):
         supply_data, bulk_data, target_symbols = fetch_all_data_concurrently()
