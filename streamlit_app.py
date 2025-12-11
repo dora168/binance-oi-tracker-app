@@ -24,17 +24,14 @@ SAMPLE_STEP = 10
 
 @st.cache_resource
 def get_db_uri(db_name):
-    """构建 connectorx 需要的连接字符串"""
     if not DB_PASSWORD:
         st.error("❌ 数据库密码未配置。")
         st.stop()
-    
     safe_pwd = quote_plus(DB_PASSWORD)
     # ⚠️ 关键修复：不包含 charset 参数
     return f"mysql://{DB_USER}:{safe_pwd}@{DB_HOST}:{DB_PORT}/{db_name}"
 
 def _fetch_supply_worker():
-    """线程任务1：获取流通量"""
     try:
         uri = get_db_uri(DB_NAME_SUPPLY)
         query = f"SELECT symbol, circulating_supply, market_cap FROM `binance_circulating_supply`"
@@ -45,10 +42,7 @@ def _fetch_supply_worker():
         return {}
 
 def _fetch_market_data_worker(limit=150):
-    """线程任务2：获取K线数据"""
     uri = get_db_uri(DB_NAME_OI)
-    
-    # 1. 先拿列表
     try:
         list_query = "SELECT symbol FROM `binance` GROUP BY symbol ORDER BY MAX(oi_usd) DESC LIMIT 200"
         df_list = cx.read_sql(uri, list_query)
@@ -57,11 +51,10 @@ def _fetch_market_data_worker(limit=150):
         return {}, []
 
     if not sorted_symbols: return {}, []
-    
     target_symbols = sorted_symbols[:limit]
     symbols_str = "', '".join(target_symbols)
     
-    # 2. 再拿详情 (SQL降采样优化)
+    # SQL 降采样优化
     sql_query = f"""
     WITH RankedData AS (
         SELECT symbol, `time`, `price`, `oi`,
@@ -75,17 +68,13 @@ def _fetch_market_data_worker(limit=150):
     AND (rn = 1 OR rn % {SAMPLE_STEP} = 0)
     ORDER BY symbol, `time` ASC;
     """
-    
     try:
         df_all = cx.read_sql(uri, sql_query)
         if df_all.empty: return {}, target_symbols
-        
         if not pd.api.types.is_datetime64_any_dtype(df_all['time']):
             df_all['time'] = pd.to_datetime(df_all['time'])
-            
         df_all['标记价格 (USDC)'] = df_all['标记价格 (USDC)'].astype(float)
         df_all['未平仓量'] = df_all['未平仓量'].astype(float)
-
         return {sym: group for sym, group in df_all.groupby('symbol')}, target_symbols
     except Exception as e:
         print(f"⚠️ 市场数据读取失败: {e}")
@@ -93,14 +82,11 @@ def _fetch_market_data_worker(limit=150):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_all_data_concurrently():
-    """并发入口"""
     with ThreadPoolExecutor(max_workers=2) as executor:
         future_supply = executor.submit(_fetch_supply_worker)
         future_market = executor.submit(_fetch_market_data_worker, 150)
-        
         supply_data = future_supply.result()
         bulk_data, target_symbols = future_market.result()
-        
     return supply_data, bulk_data, target_symbols
 
 # --- C. 辅助与绘图 ---
@@ -123,46 +109,38 @@ datum.value >= 1000 ? format(datum.value / 1000, ',.1f') + 'K' :
 format(datum.value, ',.0f')
 """
 
-def create_dual_axis_chart(df, symbol):
+# ⚡ 备用方案：专门画 OI 的扁平图表
+def create_oi_only_chart(df):
     if df.empty: return None
-    base = alt.Chart(df).encode(alt.X('time', axis=alt.Axis(labels=False, title=None)))
-    line_price = base.mark_line(color='#d62728', strokeWidth=2).encode(
-        alt.Y('标记价格 (USDC)', axis=alt.Axis(title='', titleColor='#d62728', orient='right'), scale=alt.Scale(zero=False))
-    )
-    line_oi = base.mark_line(color='purple', strokeWidth=2).encode(
-        alt.Y('未平仓量', axis=alt.Axis(title='OI', titleColor='purple', orient='right', offset=45, labelExpr=axis_format_logic), scale=alt.Scale(zero=False))
-    )
-    return alt.layer(line_price, line_oi).resolve_scale(y='independent').properties(height=350)
-
-# --- TradingView Widget (加载标准 OI, 白色背景, 填满容器) ---
-def render_tradingview_widget(symbol, height=380):
-    container_id = f"tv_{symbol}"
+    base = alt.Chart(df).encode(alt.X('time', axis=alt.Axis(labels=False, title=None, grid=False)))
     
+    line_oi = base.mark_area(
+        line={'color':'purple'}, 
+        color=alt.Gradient(
+            gradient='linear',
+            stops=[alt.GradientStop(color='purple', offset=0),
+                   alt.GradientStop(color='white', offset=1)],
+            x1=1, x2=1, y1=1, y2=0
+        )
+    ).encode(
+        alt.Y('未平仓量', axis=alt.Axis(title='Open Interest', titleColor='purple', orient='right', tickCount=3, labelExpr=axis_format_logic), scale=alt.Scale(zero=False)),
+        tooltip=[alt.Tooltip('time', format="%H:%M"), alt.Tooltip('未平仓量', format=',.0f')]
+    ).properties(height=100) # 高度设小一点，紧贴上方
+    
+    return line_oi
+
+# --- TradingView Widget (指定 ID 版) ---
+def render_tradingview_widget(symbol, height=350):
+    container_id = f"tv_{symbol}"
     clean_symbol = symbol.upper().replace("USDT", "")
     tv_symbol = f"BINANCE:{clean_symbol}USDT.P"
 
     html_code = f"""
     <style>
-        /* 🌟 暴力重置 CSS，解决"没填满框框"的问题 */
-        body, html {{ 
-            margin: 0 !important; 
-            padding: 0 !important; 
-            height: 100% !important; 
-            width: 100% !important; 
-            overflow: hidden !important;
-            background-color: #ffffff;
-        }}
-        .tradingview-widget-container {{ 
-            height: 100% !important; 
-            width: 100% !important; 
-        }}
-        #{container_id} {{
-            height: 100% !important; 
-            width: 100% !important; 
-            border: none !important;
-        }}
+        body, html {{ margin: 0 !important; padding: 0 !important; height: 100% !important; width: 100% !important; overflow: hidden !important; background-color: #ffffff; }}
+        .tradingview-widget-container {{ height: 100% !important; width: 100% !important; }}
+        #{container_id} {{ height: 100% !important; width: 100% !important; }}
     </style>
-
     <div class="tradingview-widget-container">
       <div id="{container_id}"></div>
       <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
@@ -173,27 +151,19 @@ def render_tradingview_widget(symbol, height=380):
         "symbol": "{tv_symbol}",
         "interval": "15",
         "timezone": "Asia/Shanghai",
-        "theme": "light",          // 白色主题
+        "theme": "light",
         "style": "1",
         "locale": "zh_CN",
         "enable_publishing": false,
-        "hide_top_toolbar": false, // 开启工具栏，方便手动检查指标
+        "hide_top_toolbar": false,
         "hide_legend": false,
         "save_image": false,
         "container_id": "{container_id}",
         "studies": [
-            "MASimple@tv-basicstudies",    
-            // 🌟 加载官方标准OI指标 🌟
-            // 注意：Widget不支持加载名为 "Crypto Open Interest" 的社区脚本
-            // 下面这个是唯一能在 Widget 中显示的官方 OI 数据
-            "OpenInterest@tv-basicstudies" 
+            "MASimple@tv-basicstudies",     // 均线
+            "OpenInterest@tv-basicstudies"  // 🌟 这里就是你要的固定内部ID
         ],
-        "disabled_features": [
-            "header_symbol_search", 
-            "header_compare", 
-            "use_localstorage_for_settings", 
-            "display_market_status"
-        ]
+        "disabled_features": ["header_symbol_search", "header_compare", "use_localstorage_for_settings", "display_market_status"]
       }}
       );
       </script>
@@ -204,9 +174,8 @@ def render_tradingview_widget(symbol, height=380):
 def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=False, list_type="", use_tv=False):
     raw_df = bulk_data.get(symbol)
     coinglass_url = f"https://www.coinglass.com/tv/zh/Binance_{symbol}USDT"
-    
     title_color = "black"
-    chart = None
+    chart_oi = None 
     info_html = ""
     
     if raw_df is not None and not raw_df.empty:
@@ -229,9 +198,9 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
                 f'</span>'
             )
         
-        if not use_tv:
-            chart_df = downsample_data(raw_df, target_points=400)
-            chart = create_dual_axis_chart(chart_df, symbol)
+        # 准备本地 OI 数据
+        chart_df = downsample_data(raw_df, target_points=400)
+        chart_oi = create_oi_only_chart(chart_df)
 
     fire_icon = "🔥" if list_type == "strength" else ("🐳" if list_type == "whale" else "")
     expander_title_html = (
@@ -249,10 +218,21 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
     with st.expander(label, expanded=True):
         st.markdown(expander_title_html, unsafe_allow_html=True)
         if use_tv:
-            # 高度调整为380，配合CSS的100%填满
-            render_tradingview_widget(symbol, height=380)
-        elif chart:
-            st.altair_chart(chart, use_container_width=True)
+            # 1. 渲染 TradingView (带你指定的ID)
+            render_tradingview_widget(symbol, height=350)
+            
+            # 2. 渲染本地数据库 OI 图 (防止TV没数据)
+            if chart_oi:
+                st.caption("📉 链上真实 OI (Backup Data)")
+                st.altair_chart(chart_oi, use_container_width=True)
+                
+        elif raw_df is not None:
+             # 双轴图逻辑 (use_tv=False 时回退)
+             base = alt.Chart(chart_df).encode(alt.X('time', axis=alt.Axis(labels=False)))
+             l_price = base.mark_line(color='#d62728').encode(alt.Y('标记价格 (USDC)', scale=alt.Scale(zero=False), axis=alt.Axis(labels=False)))
+             l_oi = base.mark_line(color='purple').encode(alt.Y('未平仓量', scale=alt.Scale(zero=False), axis=alt.Axis(title='OI', orient='right', labelExpr=axis_format_logic)))
+             st.altair_chart((l_price + l_oi).resolve_scale(y='independent').properties(height=350), use_container_width=True)
+             
         else:
             st.info("暂无数据")
 
@@ -260,9 +240,9 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
 
 def main_app():
     st.set_page_config(layout="wide", page_title="Binance OI Dashboard")
-    st.title("⚡ Binance OI 双塔监控 (TradingView + OI指标)")
+    st.title("⚡ Binance OI 双塔监控 (Final Version)")
     
-    with st.spinner("🚀 极速加载中 (Rust引擎 + 多线程并发)..."):
+    with st.spinner("🚀 极速加载中..."):
         supply_data, bulk_data, target_symbols = fetch_all_data_concurrently()
 
     if not bulk_data:
@@ -308,10 +288,8 @@ def main_app():
         })
 
     col_left, col_right = st.columns(2)
-    
     ranking_data.sort(key=lambda x: x['intensity'], reverse=True)
     top_intensity = ranking_data[:10]
-    
     ranking_data.sort(key=lambda x: x['oi_growth_usd'], reverse=True)
     top_whales = ranking_data[:10]
 
