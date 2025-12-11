@@ -20,18 +20,22 @@ DB_NAME_SUPPLY = 'circulating_supply'
 DATA_LIMIT_RAW = 4000
 SAMPLE_STEP = 10 
 
-# --- B. 数据库功能 (Rust加速 + URL修复) ---
+# --- B. 数据库功能 (Rust加速 + 修复URL报错) ---
 
 @st.cache_resource
 def get_db_uri(db_name):
+    """构建 connectorx 需要的连接字符串"""
     if not DB_PASSWORD:
         st.error("❌ 数据库密码未配置。")
         st.stop()
+    
     safe_pwd = quote_plus(DB_PASSWORD)
-    # ⚠️ 修复关键：Rust 引擎 connectorx 不支持 ?charset 参数，必须删掉！
+    
+    # ⚠️ 关键修复：绝对不要加 ?charset=utf8mb4，这是你在截图7里报错的原因
     return f"mysql://{DB_USER}:{safe_pwd}@{DB_HOST}:{DB_PORT}/{db_name}"
 
 def _fetch_supply_worker():
+    """线程任务1：获取流通量"""
     try:
         uri = get_db_uri(DB_NAME_SUPPLY)
         query = f"SELECT symbol, circulating_supply, market_cap FROM `binance_circulating_supply`"
@@ -42,7 +46,10 @@ def _fetch_supply_worker():
         return {}
 
 def _fetch_market_data_worker(limit=150):
+    """线程任务2：获取K线数据"""
     uri = get_db_uri(DB_NAME_OI)
+    
+    # 1. 先拿列表
     try:
         list_query = "SELECT symbol FROM `binance` GROUP BY symbol ORDER BY MAX(oi_usd) DESC LIMIT 200"
         df_list = cx.read_sql(uri, list_query)
@@ -51,10 +58,11 @@ def _fetch_market_data_worker(limit=150):
         return {}, []
 
     if not sorted_symbols: return {}, []
+    
     target_symbols = sorted_symbols[:limit]
     symbols_str = "', '".join(target_symbols)
     
-    # SQL 仅用于计算排名数据
+    # 2. 再拿详情 (SQL降采样优化)
     sql_query = f"""
     WITH RankedData AS (
         SELECT symbol, `time`, `price`, `oi`,
@@ -68,13 +76,18 @@ def _fetch_market_data_worker(limit=150):
     AND (rn = 1 OR rn % {SAMPLE_STEP} = 0)
     ORDER BY symbol, `time` ASC;
     """
+    
     try:
         df_all = cx.read_sql(uri, sql_query)
         if df_all.empty: return {}, target_symbols
+        
+        # 格式修正
         if not pd.api.types.is_datetime64_any_dtype(df_all['time']):
             df_all['time'] = pd.to_datetime(df_all['time'])
+            
         df_all['标记价格 (USDC)'] = df_all['标记价格 (USDC)'].astype(float)
         df_all['未平仓量'] = df_all['未平仓量'].astype(float)
+
         return {sym: group for sym, group in df_all.groupby('symbol')}, target_symbols
     except Exception as e:
         print(f"⚠️ 市场数据读取失败: {e}")
@@ -82,14 +95,17 @@ def _fetch_market_data_worker(limit=150):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_all_data_concurrently():
+    """并发入口"""
     with ThreadPoolExecutor(max_workers=2) as executor:
         future_supply = executor.submit(_fetch_supply_worker)
         future_market = executor.submit(_fetch_market_data_worker, 150)
+        
         supply_data = future_supply.result()
         bulk_data, target_symbols = future_market.result()
+        
     return supply_data, bulk_data, target_symbols
 
-# --- C. 辅助函数 ---
+# --- C. 辅助与绘图 ---
 
 def format_number(num):
     if abs(num) >= 1_000_000_000: return f"{num / 1_000_000_000:.2f}B"
@@ -102,7 +118,7 @@ def downsample_data(df, target_points=200):
     step = len(df) // target_points
     return df.iloc[::step]
 
-# 用于底部列表的 Altair 图 (保留用于非核心币种)
+# 用于底部列表的 Altair 图
 def create_dual_axis_chart(df, symbol):
     if df.empty: return None
     axis_format_logic = "datum.value >= 1000000 ? format(datum.value / 1000000, ',.2f') + 'M' : format(datum.value, ',.0f')"
@@ -115,7 +131,7 @@ def create_dual_axis_chart(df, symbol):
     )
     return alt.layer(line_price, line_oi).resolve_scale(y='independent').properties(height=350)
 
-# --- TradingView Widget (OI 终极修复版) ---
+# --- TradingView Widget (已加入推测的 Crypto OI ID) ---
 def render_tradingview_widget(symbol, height=450):
     container_id = f"tv_{symbol}"
     
@@ -123,8 +139,6 @@ def render_tradingview_widget(symbol, height=450):
     clean_symbol = symbol.upper().replace("USDT", "")
     tv_symbol = f"BINANCE:{clean_symbol}USDT.P"
 
-    # 这里我们尝试放入所有可能的 OI 指标 ID
-    # TradingView 会自动忽略无效的，加载有效的
     html_code = f"""
     <style>
         body, html {{ margin: 0 !important; padding: 0 !important; height: 100% !important; width: 100% !important; overflow: hidden !important; background-color: #ffffff; }}
@@ -150,11 +164,12 @@ def render_tradingview_widget(symbol, height=450):
         "save_image": false,
         "container_id": "{container_id}",
         "studies": [
-            "MASimple@tv-basicstudies",    // 均线
-            "OpenInterest@tv-basicstudies",// 1. 标准 ID
-            "Open_Interest",               // 2. 常见变体
-            "Crypto Open Interest"         // 3. 你的截图名称
+            "MASimple@tv-basicstudies",      
+            "STD;Crypto_Open_Interest",    // 🎯 极大概率是这个标准ID
+            "OpenInterest@tv-basicstudies" // 备用标准ID
         ],
+        // 如果上面那个 STD;... 不行，请把你在 F12 Payload 里找到的 PUB;... ID 替换进去
+        
         "disabled_features": ["header_symbol_search", "header_compare", "use_localstorage_for_settings", "display_market_status"]
       }}
       );
@@ -204,13 +219,11 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
 
     with st.expander(label, expanded=True):
         st.markdown(expander_title_html, unsafe_allow_html=True)
-        
         if use_tv:
-            # 🌟 只渲染 TradingView，无本地图
+            # 渲染 TradingView (纯净版)
             render_tradingview_widget(symbol, height=450)
-            
         elif raw_df is not None:
-             # 底部非 Top10 列表依然使用轻量级 Altair
+             # 底部列表依然使用轻量级 Altair
              chart_df = downsample_data(raw_df, target_points=400)
              chart = create_dual_axis_chart(chart_df, symbol)
              if chart:
@@ -224,7 +237,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
 
 def main_app():
     st.set_page_config(layout="wide", page_title="Binance OI Dashboard")
-    st.title("⚡ Binance OI 双塔监控 (Full TV Edition)")
+    st.title("⚡ Binance OI 双塔监控 (Pure TradingView)")
     
     with st.spinner("🚀 极速加载中..."):
         supply_data, bulk_data, target_symbols = fetch_all_data_concurrently()
