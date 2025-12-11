@@ -54,7 +54,7 @@ def _fetch_market_data_worker(limit=150):
     target_symbols = sorted_symbols[:limit]
     symbols_str = "', '".join(target_symbols)
     
-    # 依然保留SQL逻辑用于计算强度榜单，但不再用于画图
+    # 依然保留SQL逻辑用于计算强度榜单
     sql_query = f"""
     WITH RankedData AS (
         SELECT symbol, `time`, `price`, `oi`,
@@ -109,7 +109,7 @@ datum.value >= 1000 ? format(datum.value / 1000, ',.1f') + 'K' :
 format(datum.value, ',.0f')
 """
 
-# 用于底部列表的 Altair 图 (TradingView太重，底部列表依然用轻量级Altair)
+# 用于底部列表的 Altair 图
 def create_dual_axis_chart(df, symbol):
     if df.empty: return None
     base = alt.Chart(df).encode(alt.X('time', axis=alt.Axis(labels=False, title=None)))
@@ -121,11 +121,10 @@ def create_dual_axis_chart(df, symbol):
     )
     return alt.layer(line_price, line_oi).resolve_scale(y='independent').properties(height=350)
 
-# --- TradingView Widget (纯净版：带Crypto OI) ---
+# --- TradingView Widget (尝试强制加载 Crypto OI) ---
 def render_tradingview_widget(symbol, height=450):
     container_id = f"tv_{symbol}"
     
-    # 清洗逻辑：NIGHTUSDT -> NIGHT -> BINANCE:NIGHTUSDT.P
     clean_symbol = symbol.upper().replace("USDT", "")
     tv_symbol = f"BINANCE:{clean_symbol}USDT.P"
 
@@ -153,9 +152,12 @@ def render_tradingview_widget(symbol, height=450):
         "hide_legend": false,
         "save_image": false,
         "container_id": "{container_id}",
+        // 🌟 饱和式指标加载：同时尝试 3 种可能的 ID，Widget 会自动忽略无效的，加载有效的
         "studies": [
-            "MASimple@tv-basicstudies",      // 均线
-            "OpenInterest@tv-basicstudies"   // 🌟 对应你的 Crypto Open Interest
+            "MASimple@tv-basicstudies",    
+            "Crypto Open Interest",        // 1. 尝试直接使用你截图里的名字
+            "Open Interest",               // 2. 尝试通用英文名
+            "OpenInterest@tv-basicstudies" // 3. 尝试标准内部ID
         ],
         "disabled_features": ["header_symbol_search", "header_compare", "use_localstorage_for_settings", "display_market_status"]
       }}
@@ -208,11 +210,11 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
         st.markdown(expander_title_html, unsafe_allow_html=True)
         
         if use_tv:
-            # 🌟 只渲染 TradingView，没有任何本地备份图
+            # 渲染 TradingView (纯净版)
             render_tradingview_widget(symbol, height=450)
             
         elif raw_df is not None:
-             # 底部非 Top10 列表依然使用轻量级 Altair
+             # 底部列表依然使用轻量级 Altair
              chart_df = downsample_data(raw_df, target_points=400)
              chart = create_dual_axis_chart(chart_df, symbol)
              if chart:
@@ -226,7 +228,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
 
 def main_app():
     st.set_page_config(layout="wide", page_title="Binance OI Dashboard")
-    st.title("⚡ Binance OI 双塔监控 (Crypto OI Edition)")
+    st.title("⚡ Binance OI 双塔监控 (Pure TradingView)")
     
     with st.spinner("🚀 极速加载中..."):
         supply_data, bulk_data, target_symbols = fetch_all_data_concurrently()
