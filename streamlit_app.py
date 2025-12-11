@@ -20,7 +20,7 @@ DB_NAME_SUPPLY = 'circulating_supply'
 DATA_LIMIT_RAW = 4000
 SAMPLE_STEP = 10 
 
-# --- B. 数据库功能 (修复 URL 报错) ---
+# --- B. 数据库功能 (修复版) ---
 
 @st.cache_resource
 def get_db_uri(db_name):
@@ -31,14 +31,14 @@ def get_db_uri(db_name):
     
     safe_pwd = quote_plus(DB_PASSWORD)
     
-    # ⚠️ 修复点：绝对不要加 ?charset=utf8mb4，Rust 引擎不认这个参数
+    # ⚠️ 关键修复：绝对不要加 ?charset=utf8mb4，Rust 引擎不认这个参数
     return f"mysql://{DB_USER}:{safe_pwd}@{DB_HOST}:{DB_PORT}/{db_name}"
 
 def _fetch_supply_worker():
     """线程任务1：获取流通量"""
     try:
         uri = get_db_uri(DB_NAME_SUPPLY)
-        # 确保表名正确，这里假设是 binance_circulating_supply
+        # 确保表名正确
         query = f"SELECT symbol, circulating_supply, market_cap FROM `binance_circulating_supply`"
         df = cx.read_sql(uri, query)
         return df.set_index('symbol').to_dict('index')
@@ -138,19 +138,37 @@ def create_dual_axis_chart(df, symbol):
     )
     return alt.layer(line_price, line_oi).resolve_scale(y='independent').properties(height=350)
 
-# --- TradingView Widget (修复 Invalid Symbol) ---
-def render_tradingview_widget(symbol, height=400):
+# --- TradingView Widget (最终修复版：填满容器 + 去除白边 + Symbol清洗) ---
+def render_tradingview_widget(symbol, height=380):
     container_id = f"tv_{symbol}"
     
-    # ⚠️ 修复点：自动清洗 Symbol
-    # 如果数据库里是 "BTCUSDT"，去掉 "USDT" 变成 "BTC"，然后再拼接
+    # 1. 清洗 Symbol：防止出现 ETHUSDTUSDT 的情况
+    # 逻辑：先统一转大写，把已有的 USDT 后缀去掉，最后统一加上 USDT.P (币安永续合约)
     clean_symbol = symbol.upper().replace("USDT", "")
-    # 拼接成 Binance 合约格式: BINANCE:BTCUSDT.P
     tv_symbol = f"BINANCE:{clean_symbol}USDT.P"
 
     html_code = f"""
-    <div class="tradingview-widget-container" style="height:100%;width:100%">
-      <div id="{container_id}" style="height:calc(100% - 32px);width:100%"></div>
+    <style>
+        body, html {{ 
+            margin: 0 !important; 
+            padding: 0 !important; 
+            height: 100% !important; 
+            width: 100% !important; 
+            overflow: hidden !important;
+            background-color: #131722; /* 和 TradingView 深色背景一致，防止加载时闪白屏 */
+        }}
+        .tradingview-widget-container {{ 
+            height: 100% !important; 
+            width: 100% !important; 
+        }}
+        #{container_id} {{
+            height: 100% !important; 
+            width: 100% !important; 
+        }}
+    </style>
+
+    <div class="tradingview-widget-container">
+      <div id="{container_id}"></div>
       <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
       <script type="text/javascript">
       new TradingView.widget(
@@ -163,18 +181,24 @@ def render_tradingview_widget(symbol, height=400):
         "style": "1",
         "locale": "zh_CN",
         "enable_publishing": false,
-        "hide_top_toolbar": false,
-        "hide_legend": true,
+        "hide_top_toolbar": false,     
+        "hide_legend": false,          
         "save_image": false,
         "container_id": "{container_id}",
         "studies": ["MASimple@tv-basicstudies"],
-        "disabled_features": ["header_symbol_search", "header_compare"]
+        "disabled_features": [
+            "header_symbol_search", 
+            "header_compare", 
+            "use_localstorage_for_settings", 
+            "display_market_status"
+        ]
       }}
       );
       </script>
     </div>
     """
-    components.html(html_code, height=height)
+    # scrolling=False 是防止滚动条的关键
+    components.html(html_code, height=height, scrolling=False)
 
 def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=False, list_type="", use_tv=False):
     raw_df = bulk_data.get(symbol)
@@ -204,6 +228,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
                 f'</span>'
             )
         
+        # 只有不用TV时才计算Altair图表
         if not use_tv:
             chart_df = downsample_data(raw_df, target_points=400)
             chart = create_dual_axis_chart(chart_df, symbol)
@@ -224,7 +249,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
     with st.expander(label, expanded=True):
         st.markdown(expander_title_html, unsafe_allow_html=True)
         if use_tv:
-            render_tradingview_widget(symbol, height=350)
+            render_tradingview_widget(symbol, height=380)
         elif chart:
             st.altair_chart(chart, use_container_width=True)
         else:
@@ -254,7 +279,7 @@ def main_app():
         current_oi = df['未平仓量'].iloc[-1]
         oi_growth_usd = (current_oi - min_oi) * current_price
         
-        # --- 修复后的市值计算 ---
+        # --- 市值计算 ---
         market_cap = 0
         supply = 0
         db_market_cap = 0
@@ -313,6 +338,7 @@ def main_app():
     with c1:
         st.subheader("📈 强度 Top 10 (Live)")
         for i, item in enumerate(top_intensity, 1):
+            # 这里的 Top 10 使用 TradingView
             render_chart_component(i, item['symbol'], bulk_data, ranking_data, True, "strength", use_tv=True)
             
     with c2:
@@ -323,12 +349,12 @@ def main_app():
     st.markdown("---")
     st.subheader("📋 其他合约列表")
 
-    # 底部仅用表格，防止卡顿
+    # 底部列表使用 Altair，避免浏览器卡顿
     shown = {i['symbol'] for i in top_intensity} | {i['symbol'] for i in top_whales}
     remaining = [s for s in target_symbols if s not in shown]
 
     for rank, symbol in enumerate(remaining, 1):
-         # 底部列表 use_tv 默认为 False，使用 Altair
+         # use_tv 默认为 False
         render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=False, use_tv=False)
 
 if __name__ == '__main__':
