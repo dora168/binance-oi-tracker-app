@@ -54,7 +54,7 @@ def _fetch_market_data_worker(limit=150):
     target_symbols = sorted_symbols[:limit]
     symbols_str = "', '".join(target_symbols)
     
-    # 仅用于计算强度榜单
+    # SQL 仅用于计算强度榜单
     sql_query = f"""
     WITH RankedData AS (
         SELECT symbol, `time`, `price`, `oi`,
@@ -115,13 +115,15 @@ def create_dual_axis_chart(df, symbol):
     )
     return alt.layer(line_price, line_oi).resolve_scale(y='independent').properties(height=350)
 
-# --- TradingView Widget (使用公共脚本ID) ---
+# --- TradingView Widget (智能 ID 版) ---
 def render_tradingview_widget(symbol, height=450):
     container_id = f"tv_{symbol}"
     
+    # ⚠️ 修复 "无效商品代码" (Invalid Symbol)
+    # 逻辑：不管传入的是 NIGHT 还是 NIGHTUSDT，统一处理成 BINANCE:NIGHTUSDT.P
     clean_symbol = symbol.upper()
     if clean_symbol.endswith("USDT"):
-        clean_symbol = clean_symbol[:-4] 
+        clean_symbol = clean_symbol[:-4] # 去掉 USDT
     
     tv_symbol = f"BINANCE:{clean_symbol}USDT.P"
 
@@ -150,11 +152,11 @@ def render_tradingview_widget(symbol, height=450):
         "save_image": false,
         "container_id": "{container_id}",
         "studies": [
-            "MASimple@tv-basicstudies",  
-            // 👇 这里是关键！我添加了3个可能的ID，包括一个必然能用的公共脚本ID
-            "PUB;58957448825842138258167355203363", // 1. Open Interest by EmreEkinci (稳定公开脚本)
-            "STD;Open_Interest",                    // 2. 标准 ID
-            "OpenInterest@tv-basicstudies"          // 3. 旧版官方 ID
+            "MASimple@tv-basicstudies",    
+            // 🎯 核心：Crypto Open Interest 的标准内部 ID
+            "STD;Crypto_Open_Interest",
+            // 备用：如果上面的不行，试一下这个
+            "OpenInterest@tv-basicstudies"
         ],
         "disabled_features": ["header_symbol_search", "header_compare", "use_localstorage_for_settings", "display_market_status"]
       }}
@@ -207,7 +209,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
         st.markdown(expander_title_html, unsafe_allow_html=True)
         
         if use_tv:
-            # 渲染 TradingView
+            # 渲染 TradingView (纯净版)
             render_tradingview_widget(symbol, height=450)
             
         elif raw_df is not None:
