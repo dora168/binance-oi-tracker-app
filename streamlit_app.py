@@ -54,7 +54,7 @@ def _fetch_market_data_worker(limit=150):
     target_symbols = sorted_symbols[:limit]
     symbols_str = "', '".join(target_symbols)
     
-    # SQL 仅用于计算强度榜单
+    # SQL 仅用于计算排名
     sql_query = f"""
     WITH RankedData AS (
         SELECT symbol, `time`, `price`, `oi`,
@@ -115,16 +115,13 @@ def create_dual_axis_chart(df, symbol):
     )
     return alt.layer(line_price, line_oi).resolve_scale(y='independent').properties(height=350)
 
-# --- TradingView Widget (智能 ID 版) ---
+# --- TradingView Widget (加载你抓到的真实 ID) ---
 def render_tradingview_widget(symbol, height=450):
     container_id = f"tv_{symbol}"
     
-    # ⚠️ 修复 "无效商品代码" (Invalid Symbol)
-    # 逻辑：不管传入的是 NIGHT 还是 NIGHTUSDT，统一处理成 BINANCE:NIGHTUSDT.P
     clean_symbol = symbol.upper()
     if clean_symbol.endswith("USDT"):
-        clean_symbol = clean_symbol[:-4] # 去掉 USDT
-    
+        clean_symbol = clean_symbol[:-4] 
     tv_symbol = f"BINANCE:{clean_symbol}USDT.P"
 
     html_code = f"""
@@ -153,9 +150,9 @@ def render_tradingview_widget(symbol, height=450):
         "container_id": "{container_id}",
         "studies": [
             "MASimple@tv-basicstudies",    
-            // 🎯 核心：Crypto Open Interest 的标准内部 ID
-            "STD;Crypto_Open_Interest",
-            // 备用：如果上面的不行，试一下这个
+            // 👇👇👇 这里的 ID 是通过 F12 抓包确认的 👇👇👇
+            "STD;Fund_crypto_open_interest",
+            // 备用
             "OpenInterest@tv-basicstudies"
         ],
         "disabled_features": ["header_symbol_search", "header_compare", "use_localstorage_for_settings", "display_market_status"]
@@ -207,13 +204,9 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
 
     with st.expander(label, expanded=True):
         st.markdown(expander_title_html, unsafe_allow_html=True)
-        
         if use_tv:
-            # 渲染 TradingView (纯净版)
             render_tradingview_widget(symbol, height=450)
-            
         elif raw_df is not None:
-             # 底部列表依然使用轻量级 Altair
              chart_df = downsample_data(raw_df, target_points=400)
              chart = create_dual_axis_chart(chart_df, symbol)
              if chart:
@@ -227,7 +220,7 @@ def render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=F
 
 def main_app():
     st.set_page_config(layout="wide", page_title="Binance OI Dashboard")
-    st.title("⚡ Binance OI 双塔监控 (Final TV Fix)")
+    st.title("⚡ Binance OI 双塔监控 (Crypto OI Final)")
     
     with st.spinner("🚀 极速加载中..."):
         supply_data, bulk_data, target_symbols = fetch_all_data_concurrently()
@@ -315,6 +308,9 @@ def main_app():
 
     for rank, symbol in enumerate(remaining, 1):
         render_chart_component(rank, symbol, bulk_data, ranking_data, is_top_mover=False, use_tv=False)
+
+if __name__ == '__main__':
+    main_app()
 
 if __name__ == '__main__':
     main_app()
