@@ -1,22 +1,24 @@
 import streamlit as st
 import streamlit.components.v1 as components
+import requests
+import pandas as pd
 
 # --- 核心功能：渲染带 OI 指标的 TradingView ---
-def render_tradingview_widget(symbol, height=450):
+def render_tradingview_widget(symbol, height=400):
     """
     渲染嵌入 Open Interest (OI) 指标的 TradingView Widget。
+    高度微调为 400 以节省空间。
     """
     container_id = f"tv_{symbol}"
     
-    # 智能清洗：输入 BTC -> 自动转为 BINANCE:BTCUSDT.P (永续合约)
+    # 智能清洗：API 返回的是 BTCUSDT，我们需要转换格式
     clean_symbol = symbol.upper().strip()
     if clean_symbol.endswith("USDT"):
         clean_symbol = clean_symbol[:-4]
     
+    # 拼接为 BINANCE:BTCUSDT.P
     tv_symbol = f"BINANCE:{clean_symbol}USDT.P"
 
-    # 注意：为了性能，HTML 部分应保持尽可能精简。
-    # 您的原始代码已经很好了，但这里我们移除了部分不必要的 !important 样式。
     html_code = f"""
     <div class="tradingview-widget-container" style="height: {height}px; width: 100%;">
       <div id="{container_id}" style="height: 100%; width: 100%;"></div>
@@ -26,104 +28,150 @@ def render_tradingview_widget(symbol, height=450):
       {{
         "autosize": true,
         "symbol": "{tv_symbol}",
-        "interval": "60",          // 默认显示1小时图
+        "interval": "60",
         "timezone": "Asia/Shanghai",
         "theme": "light",
         "style": "1",
         "locale": "zh_CN",
         "enable_publishing": false,
-        "hide_top_toolbar": false,
+        "hide_top_toolbar": true,       // 隐藏顶部工具栏以节省渲染资源
         "hide_legend": false,
         "save_image": false,
         "container_id": "{container_id}",
         "studies": [
-            "MASimple@tv-basicstudies",    
-            "STD;Fund_crypto_open_interest" // OI 指标 ID
+            "MASimple@tv-basicstudies",     
+            "STD;Fund_crypto_open_interest" // OI 指标
         ],
-        // 禁用更多不必要的 UI 元素
-        "disabled_features": ["header_symbol_search", "header_compare", "use_localstorage_for_settings", "display_market_status", "timeframes_toolbar"]
+        "disabled_features": [
+            "header_symbol_search", "header_compare", "use_localstorage_for_settings", 
+            "display_market_status", "timeframes_toolbar", "volume_force_overlay",
+            "header_chart_type", "header_settings", "header_indicators", "header_screenshot"
+        ]
       }}
       );
       </script>
     </div>
     """
-    # 关键优化点：scrolling=True 允许 Streamlit 内部处理高度，
-    # 但由于 TradingView 内部设置了高度，我们还是用 False 保证图表高度固定
     components.html(html_code, height=height, scrolling=False)
 
+# --- 功能：获取币安成交量前 N 名 ---
+@st.cache_data(ttl=300) 
+def get_top_volume_pairs(limit=100):
+    """
+    从币安 FAPI 获取 24小时成交量排名的 USDT 永续合约
+    """
+    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        
+        # 1. 过滤：必须以 USDT 结尾，排除类似 BTCUSD_240628
+        usdt_pairs = [
+            item for item in data 
+            if item['symbol'].endswith('USDT') and '_' not in item['symbol']
+        ]
+        
+        # 2. 排序：按 quoteVolume (USDT成交额) 降序
+        sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x['quoteVolume']), reverse=True)
+        
+        # 3. 截取前 N 名
+        top_n = sorted_pairs[:limit]
+        
+        return [item['symbol'] for item in top_n]
+        
+    except Exception as e:
+        st.error(f"无法连接币安 API: {e}")
+        return []
 
 # --- 主程序 ---
 def main_app():
-    st.set_page_config(layout="wide", page_title="Crypto OI Wall")
-    st.title("⚡ TradingView OI 监控墙")
+    st.set_page_config(layout="wide", page_title="Top 100 Crypto OI Wall")
+    st.title("⚡ 币安成交量前 100 强 OI 监控墙")
     
-    # 默认列表 (预设一些热门币)
-    default_symbols = [
-        "BTC", "ETH", "SOL", "DOGE", 
-        "PEPE", "WIF", "ENA", "ORDI", 
-        "NEAR", "AVAX", "SUI", "APT",
-        "XRP", "LTC", "ADA", "LINK" # 新增一些，便于演示分页效果
-    ]
-    
-    # 侧边栏：允许你随时修改要监控的币种
+    # --- 侧边栏配置 ---
     with st.sidebar:
         st.header("⚙️ 监控配置")
-        user_input = st.text_area(
-            "输入代币代码 (空格或逗号分隔)", 
-            value=" ".join(default_symbols), 
-            height=300,
-            help="输入例如: BTC ETH SOL，系统会自动拼接成 USDT 永续合约地址"
-        )
-        # 优化控制：控制每个 Tab 中显示的图表数量，默认为 4 个
-        charts_per_tab = st.slider("每个分组（Tab）的图表数量", 2, 6, 4)
-    
-    # 处理用户输入，转为列表
-    symbols = [s.strip().upper() for s in user_input.replace(",", " ").split() if s.strip()]
-    
-    if not symbols:
-        st.warning("请输入至少一个代币代码")
+        
+        # 模式选择
+        data_source = st.radio("数据来源", ["🏆 币安成交量 Top 100", "📝 手动输入"])
+        
+        symbols = []
+        
+        if data_source == "🏆 币安成交量 Top 100":
+            if st.button("刷新排名数据", type="primary"):
+                st.cache_data.clear()
+                st.rerun()
+            
+            with st.spinner("正在从币安获取实时成交量数据..."):
+                symbols = get_top_volume_pairs(100)
+            
+            if symbols:
+                st.success(f"已获取成交量前 {len(symbols)} 名币种")
+        
+        else:
+            default_input = "BTC ETH SOL DOGE PEPE WIF"
+            user_input = st.text_area(
+                "输入代币代码", 
+                value=default_input, 
+                height=150
+            )
+            symbols = [s.strip().upper() for s in user_input.replace(",", " ").split() if s.strip()]
+
+        st.markdown("---")
+        st.header("🖥️ 视图控制")
+        
+        # 分页控制
+        total_items = len(symbols)
+        if total_items > 0:
+            # === 修改点：调整选项并默认选中 50 ===
+            items_per_page = st.select_slider(
+                "每页显示图表数量",
+                options=[10, 20, 50, 100], 
+                value=50  # <--- 默认设为 50
+            )
+            
+            total_pages = (total_items + items_per_page - 1) // items_per_page
+            
+            current_page = st.number_input(
+                f"页码 (共 {total_pages} 页)", 
+                min_value=1, 
+                max_value=total_pages, 
+                value=1
+            )
+            
+            start_idx = (current_page - 1) * items_per_page
+            end_idx = min(start_idx + items_per_page, total_items)
+            
+            current_batch = symbols[start_idx:end_idx]
+        else:
+            current_batch = []
+            st.warning("暂无数据")
+
+    # --- 主界面渲染 ---
+    if not current_batch:
         return
 
-    st.caption(f"当前正在监控 {len(symbols)} 个合约的实时价格与持仓量 (OI)")
+    st.markdown(f"### 📄 第 {current_page} 页: 排名 {start_idx + 1} - {end_idx}")
     st.markdown("---")
 
-    # --- 关键性能优化：使用 st.tabs 分页加载图表 ---
+    # 使用 Grid 布局渲染
+    cols = st.columns(2)
     
-    # 1. 将所有币种分组
-    num_tabs = (len(symbols) + charts_per_tab - 1) // charts_per_tab
-    symbol_groups = [
-        symbols[i:i + charts_per_tab] 
-        for i in range(0, len(symbols), charts_per_tab)
-    ]
-    
-    # 2. 创建 Tab 列表
-    tab_titles = [f"分组 {i+1} ({len(group)} 个)" for i, group in enumerate(symbol_groups)]
-    tabs = st.tabs(tab_titles)
-
-    # 3. 遍历 Tab 组，渲染图表
-    for tab_index, group in enumerate(symbol_groups):
-        with tabs[tab_index]:
-            # 使用两列布局渲染图表
-            cols = st.columns(2)
+    for i, sym in enumerate(current_batch):
+        with cols[i % 2]: 
+            clean_sym_for_link = sym.replace("USDT", "") 
+            coinglass_url = f"https://www.coinglass.com/tv/zh/Binance_{clean_sym_for_link}USDT"
             
-            for i, sym in enumerate(group):
-                with cols[i % 2]: # 奇数在左，偶数在右
-                    # Coinglass 链接
-                    coinglass_url = f"https://www.coinglass.com/tv/zh/Binance_{sym}USDT"
-                    st.markdown(f"### 🔥 [{sym}]({coinglass_url})")
-                    
-                    # 渲染图表
-                    # 对于 OI 监控，保持高度固定为 450 比较合适
-                    render_tradingview_widget(sym, height=450)
-                    st.markdown("---")
+            st.markdown(f"#### #{start_idx + i + 1} [{sym}]({coinglass_url})")
             
-            # 在最后一个 Tab 底部显示总数
-            if tab_index == len(symbol_groups) - 1:
-                 st.info(f"🎨 所有图表加载完成。总计 {len(symbols)} 个监控对象。")
-                
+            # 渲染图表
+            render_tradingview_widget(sym, height=400)
+            st.markdown("---")
+            
+    if end_idx < total_items:
+        st.info(f"⬇️ 还有 {total_items - end_idx} 个币种，请在侧边栏翻页。")
+    else:
+        st.success("🎉 已显示完前 100 名的所有币种。")
 
 if __name__ == '__main__':
-    # 开启 Streamlit 的 set_page_config 之后，即使没有显式调用 main_app() 
-    # Streamlit 也会运行整个脚本，所以这里的 __name__ == '__main__' 
-    # 依然是标准且必要的。
     main_app()
