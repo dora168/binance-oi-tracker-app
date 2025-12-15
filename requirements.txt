@@ -6,3 +6,4 @@ cryptography
 connectorx
 pymysql
 cryptography
+requests pandas streamlit
