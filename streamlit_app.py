@@ -1,23 +1,30 @@
 import streamlit as st
 import streamlit.components.v1 as components
 import requests
-import pandas as pd
 
-# --- 核心功能：渲染带 OI 指标的 TradingView ---
+# --- 核心配置 ---
+# 如果 API 失败，使用这份静态的 Top 50 热门币种列表作为保底
+FALLBACK_SYMBOLS = [
+    "BTC", "ETH", "SOL", "BNB", "DOGE", "XRP", "ADA", "AVAX", "SHIB", "DOT",
+    "LINK", "TRX", "MATIC", "NEAR", "LTC", "BCH", "UNI", "APT", "FIL", "IMX",
+    "ARB", "OP", "INJ", "RNDR", "ATOM", "ETC", "XLM", "STX", "SUI", "VET",
+    "ORDI", "WIF", "PEPE", "THETA", "FTM", "ALGO", "TIA", "SEI", "GRT", "AAVE",
+    "FLOW", "SAND", "MANA", "EGLD", "AXS", "XTZ", "EOS", "QNT", "GALA", "NEO"
+]
+
+# --- 组件：渲染 TradingView Widget ---
 def render_tradingview_widget(symbol, height=400):
     """
-    渲染嵌入 Open Interest (OI) 指标的 TradingView Widget。
-    高度微调为 400 以节省空间。
+    渲染嵌入 Open Interest (OI) 指标的 TradingView Widget
     """
-    container_id = f"tv_{symbol}"
-    
-    # 智能清洗：API 返回的是 BTCUSDT，我们需要转换格式
+    # 清洗数据，确保格式为纯币种名称 (例如 BTC)
     clean_symbol = symbol.upper().strip()
     if clean_symbol.endswith("USDT"):
         clean_symbol = clean_symbol[:-4]
     
-    # 拼接为 BINANCE:BTCUSDT.P
+    # 构造 TradingView 能够识别的 币安永续合约 代码
     tv_symbol = f"BINANCE:{clean_symbol}USDT.P"
+    container_id = f"tv_{clean_symbol}"
 
     html_code = f"""
     <div class="tradingview-widget-container" style="height: {height}px; width: 100%;">
@@ -34,18 +41,18 @@ def render_tradingview_widget(symbol, height=400):
         "style": "1",
         "locale": "zh_CN",
         "enable_publishing": false,
-        "hide_top_toolbar": true,       // 隐藏顶部工具栏以节省渲染资源
+        "hide_top_toolbar": true,
         "hide_legend": false,
         "save_image": false,
         "container_id": "{container_id}",
         "studies": [
             "MASimple@tv-basicstudies",     
-            "STD;Fund_crypto_open_interest" // OI 指标
+            "STD;Fund_crypto_open_interest"
         ],
         "disabled_features": [
             "header_symbol_search", "header_compare", "use_localstorage_for_settings", 
             "display_market_status", "timeframes_toolbar", "volume_force_overlay",
-            "header_chart_type", "header_settings", "header_indicators", "header_screenshot"
+            "header_chart_type", "header_settings", "header_indicators"
         ]
       }}
       );
@@ -54,124 +61,103 @@ def render_tradingview_widget(symbol, height=400):
     """
     components.html(html_code, height=height, scrolling=False)
 
-# --- 功能：获取币安成交量前 N 名 ---
-@st.cache_data(ttl=300) 
-def get_top_volume_pairs(limit=100):
+# --- 数据获取：带容错机制 ---
+@st.cache_data(ttl=600) # 缓存10分钟
+def get_market_data(limit=100):
     """
-    从币安 FAPI 获取 24小时成交量排名的 USDT 永续合约
+    尝试从 API 获取数据，如果失败（被墙），则返回保底列表。
     """
-    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    # 尝试 1: CoinGecko API (比币安更容易在云端访问)
     try:
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        
-        # 1. 过滤：必须以 USDT 结尾，排除类似 BTCUSD_240628
-        usdt_pairs = [
-            item for item in data 
-            if item['symbol'].endswith('USDT') and '_' not in item['symbol']
-        ]
-        
-        # 2. 排序：按 quoteVolume (USDT成交额) 降序
-        sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x['quoteVolume']), reverse=True)
-        
-        # 3. 截取前 N 名
-        top_n = sorted_pairs[:limit]
-        
-        return [item['symbol'] for item in top_n]
-        
-    except Exception as e:
-        st.error(f"无法连接币安 API: {e}")
-        return []
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "volume_desc", # 按成交量排序
+            "per_page": limit,
+            "page": 1,
+            "sparkline": "false"
+        }
+        response = requests.get(url, params=params, timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            # 提取 symbol 并转大写
+            return [item['symbol'].upper() for item in data], "API (CoinGecko)"
+    except:
+        pass
 
-# --- 主程序 ---
-def main_app():
-    st.set_page_config(layout="wide", page_title="Top 100 Crypto OI Wall")
-    st.title("⚡ 币安成交量前 100 强 OI 监控墙")
+    # 尝试 2: 币安 API (在本地有效，但云端常被封锁)
+    try:
+        url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+        response = requests.get(url, timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            usdt_pairs = [x for x in data if x['symbol'].endswith('USDT') and '_' not in x['symbol']]
+            sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x['quoteVolume']), reverse=True)
+            # 这里的 symbol 已经是 BTCUSDT 格式
+            return [x['symbol'] for x in sorted_pairs[:limit]], "API (Binance)"
+    except:
+        pass
+
+    # 如果都失败，返回保底列表
+    return FALLBACK_SYMBOLS, "离线保底列表 (API 连接受限)"
+
+# --- 主程序逻辑 ---
+def main():
+    st.set_page_config(layout="wide", page_title="Crypto OI Wall")
     
-    # --- 侧边栏配置 ---
+    st.title("⚡ 币安成交量 Top 100 - OI 监控墙")
+
+    # 1. 获取数据
+    with st.spinner("正在加载市场数据..."):
+        symbols, source_type = get_market_data(100)
+
+    # 2. 侧边栏控制
     with st.sidebar:
-        st.header("⚙️ 监控配置")
+        st.header("⚙️ 控制面板")
         
-        # 模式选择
-        data_source = st.radio("数据来源", ["🏆 币安成交量 Top 100", "📝 手动输入"])
-        
-        symbols = []
-        
-        if data_source == "🏆 币安成交量 Top 100":
-            if st.button("刷新排名数据", type="primary"):
-                st.cache_data.clear()
-                st.rerun()
-            
-            with st.spinner("正在从币安获取实时成交量数据..."):
-                symbols = get_top_volume_pairs(100)
-            
-            if symbols:
-                st.success(f"已获取成交量前 {len(symbols)} 名币种")
-        
+        # 显示数据源状态
+        if "离线" in source_type:
+            st.warning(f"⚠️ 当前使用：{source_type}")
+            st.caption("原因：云服务器 IP 可能被交易所暂时拦截，已自动切换至预设热门币种，不影响图表查看。")
         else:
-            default_input = "BTC ETH SOL DOGE PEPE WIF"
-            user_input = st.text_area(
-                "输入代币代码", 
-                value=default_input, 
-                height=150
-            )
-            symbols = [s.strip().upper() for s in user_input.replace(",", " ").split() if s.strip()]
+            st.success(f"✅ 数据来源：{source_type}")
 
+        if st.button("强制刷新数据"):
+            st.cache_data.clear()
+            st.rerun()
+            
         st.markdown("---")
-        st.header("🖥️ 视图控制")
         
-        # 分页控制
+        # 分页设置
         total_items = len(symbols)
-        if total_items > 0:
-            # === 修改点：调整选项并默认选中 50 ===
-            items_per_page = st.select_slider(
-                "每页显示图表数量",
-                options=[10, 20, 50, 100], 
-                value=50  # <--- 默认设为 50
-            )
-            
-            total_pages = (total_items + items_per_page - 1) // items_per_page
-            
-            current_page = st.number_input(
-                f"页码 (共 {total_pages} 页)", 
-                min_value=1, 
-                max_value=total_pages, 
-                value=1
-            )
-            
-            start_idx = (current_page - 1) * items_per_page
-            end_idx = min(start_idx + items_per_page, total_items)
-            
-            current_batch = symbols[start_idx:end_idx]
-        else:
-            current_batch = []
-            st.warning("暂无数据")
+        items_per_page = st.select_slider("每页显示数量", options=[10, 20, 50, 100], value=50)
+        
+        # 计算页数
+        total_pages = (total_items + items_per_page - 1) // items_per_page
+        current_page = st.number_input(f"页码 (共 {total_pages} 页)", min_value=1, max_value=total_pages, value=1)
 
-    # --- 主界面渲染 ---
-    if not current_batch:
-        return
+    # 3. 数据切片
+    start_idx = (current_page - 1) * items_per_page
+    end_idx = min(start_idx + items_per_page, total_items)
+    current_batch = symbols[start_idx:end_idx]
 
-    st.markdown(f"### 📄 第 {current_page} 页: 排名 {start_idx + 1} - {end_idx}")
-    st.markdown("---")
-
-    # 使用 Grid 布局渲染
-    cols = st.columns(2)
+    # 4. 页面显示
+    st.markdown(f"**当前显示：第 {start_idx + 1} - {end_idx} 名**")
     
+    # 渲染图表 Grid
+    cols = st.columns(2) # 两列布局
     for i, sym in enumerate(current_batch):
-        with cols[i % 2]: 
-            clean_sym_for_link = sym.replace("USDT", "") 
-            coinglass_url = f"https://www.coinglass.com/tv/zh/Binance_{clean_sym_for_link}USDT"
+        with cols[i % 2]:
+            # 生成跳转链接
+            link_symbol = sym.replace("USDT", "")
+            url = f"https://www.coinglass.com/tv/zh/Binance_{link_symbol}USDT"
             
-            st.markdown(f"#### #{start_idx + i + 1} [{sym}]({coinglass_url})")
-            
-            # 渲染图表
-            render_tradingview_widget(sym, height=400)
+            st.markdown(f"#### #{start_idx + i + 1} {sym} ([Coinglass]({url}))")
+            render_tradingview_widget(sym)
             st.markdown("---")
-            
-    if end_idx < total_items:
-        st.info(f"⬇️ 还有 {total_items - end_idx} 个币种，请在侧边栏翻页。")
-    else:
-        st.success("🎉 已显示完前 100 名的所有币种。")
 
-if __name__ == '__main__':
-    main_app()
+    if end_idx >= total_items:
+        st.success("已显示全部加载的币种。")
+
+if __name__ == "__main__":
+    main()
