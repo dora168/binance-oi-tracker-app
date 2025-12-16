@@ -13,7 +13,7 @@ DATA_SOURCE = "http://43.156.132.4:8080/oi_analysis.csv"
 # ============================================
 
 def format_money(num):
-    """将数字格式化为 B/M/K (用户指定格式)"""
+    """将数字格式化为 B/M/K"""
     try:
         num = float(num)
         if num >= 1_000_000_000: return f"{num/1_000_000_000:.2f}B"
@@ -26,14 +26,11 @@ def format_money(num):
 def load_data(url):
     """从远程 URL 加载 CSV 数据"""
     try:
-        # 设置超时时间，防止卡死
         response = requests.get(url, timeout=5)
-        
         if response.status_code != 200:
             st.error(f"❌ 无法连接服务器，状态码: {response.status_code}")
             return pd.DataFrame()
         
-        # 处理编码，防止中文乱码 (优先 utf-8-sig, 备用 gbk)
         try:
             content = response.content.decode('utf-8-sig')
         except:
@@ -43,15 +40,11 @@ def load_data(url):
         return df
     except Exception as e:
         st.error(f"❌ 数据加载失败: {e}")
-        st.caption("请检查：1.服务器上的 python -m http.server 是否开启。 2.防火墙 8080 端口是否放行。")
         return pd.DataFrame()
 
 def render_tradingview_widget(symbol, height=400):
     """渲染 TradingView 组件"""
-    # 假设 CSV 里的 symbol 是 BTCUSDT，TradingView 需要 BINANCE:BTCUSDT.P
     clean_symbol = symbol.upper().strip()
-    
-    # 构造 TradingView 格式
     tv_symbol = f"BINANCE:{clean_symbol}.P"
     container_id = f"tv_{clean_symbol}"
 
@@ -94,103 +87,103 @@ def main():
     st.set_page_config(layout="wide", page_title="OI 异动监控")
     st.title("🚀 主力建仓监控 (OI增幅 > 3%)")
 
-    # 1. 顶部操作栏
-    col1, col2 = st.columns([1, 6])
-    with col1:
-        if st.button("🔄 刷新数据", type="primary"):
-            st.rerun()
-    with col2:
-        st.caption(f"数据源: {DATA_SOURCE}")
-
-    # 2. 加载数据
-    with st.spinner("正在从服务器获取最新数据..."):
+    # 1. 加载数据
+    with st.spinner("正在获取最新数据..."):
         df = load_data(DATA_SOURCE)
     
     if df.empty:
         return
 
-    # 3. 数据处理与筛选
-    # 确保有 increase_ratio 列
+    # 2. 数据清洗与筛选
     if 'increase_ratio' not in df.columns:
-        st.error("CSV 文件中缺少 'increase_ratio' 列，请检查后端脚本。")
-        st.dataframe(df.head())
+        st.error("数据缺失 'increase_ratio' 列")
         return
 
-    # === 核心逻辑修改：只获取增加比例大于 3% 的合约 ===
-    # 假设 increase_ratio 是小数 (0.03 代表 3%)
-    filtered_df = df[df['increase_ratio'] > 0.03]
+    # 筛选 > 3%
+    filtered_df = df[df['increase_ratio'] > 0.03].copy()
+    
+    # 计算流通市值 (如果 CSV 里没有直接提供，就现算)
+    # 假设 CSV 有 'price' 和 'circ_supply'
+    if 'circ_supply' in filtered_df.columns and 'price' in filtered_df.columns:
+        filtered_df['market_cap'] = filtered_df['circ_supply'] * filtered_df['price']
+    else:
+        filtered_df['market_cap'] = 0
 
-    # 按比例从高到低排序
+    # 排序
     filtered_df = filtered_df.sort_values(by='increase_ratio', ascending=False)
 
-    # 4. 显示结果 & 分页逻辑
+    # 3. 分页逻辑 (移至主界面)
+    total_items = len(filtered_df)
+    ITEMS_PER_PAGE = 20
+    total_pages = max(1, (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+
+    # --- 顶部控制栏 ---
+    c1, c2, c3 = st.columns([1, 2, 3])
+    with c1:
+        if st.button("🔄 刷新数据", type="primary", use_container_width=True):
+            st.rerun()
+    with c2:
+        if total_pages > 1:
+            current_page = st.number_input(
+                f"当前页 (共 {total_pages} 页, {total_items} 个标的)", 
+                min_value=1, max_value=total_pages, value=1, step=1
+            )
+        else:
+            current_page = 1
+            st.markdown(f"**共发现 {total_items} 个标的**")
+    
+    st.markdown("---")
+
+    # 4. 显示内容
     if filtered_df.empty:
         st.info("😴 当前市场平淡，没有 OI 增幅超过 3% 的合约。")
-    else:
-        total_items = len(filtered_df)
-        ITEMS_PER_PAGE = 20
-        
-        # 计算总页数
-        total_pages = (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
-        
-        # === 侧边栏：分页控制 ===
-        with st.sidebar:
-            st.header("📄 分页控制")
-            st.write(f"共发现: **{total_items}** 个标的")
-            
-            if total_pages > 1:
-                current_page = st.number_input(
-                    f"页码 (共 {total_pages} 页)", 
-                    min_value=1, 
-                    max_value=total_pages, 
-                    value=1,
-                    step=1
-                )
-            else:
-                current_page = 1
-                st.caption("数量较少，无需分页")
-        
-        # === 数据切片 ===
-        start_idx = (current_page - 1) * ITEMS_PER_PAGE
-        end_idx = min(start_idx + ITEMS_PER_PAGE, total_items)
-        
-        current_batch = filtered_df.iloc[start_idx:end_idx]
-        
-        st.success(f"🔥 发现 {total_items} 个猛烈建仓合约 (当前显示第 {start_idx + 1} - {end_idx} 名)")
-        
-        # 使用 Grid 布局展示图表 (两列)
-        cols = st.columns(2)
-        
-        for i, (_, row) in enumerate(current_batch.iterrows()):
-            with cols[i % 2]:
-                symbol = row['symbol']
-                # 计算百分比显示
-                ratio_pct = row['increase_ratio'] * 100
-                # 使用你指定的 format_money 函数格式化金额
-                amount_str = format_money(row['increase_amount_usdt'])
-                # 价格 (转为float再显示，防止报错)
-                try:
-                    price_val = float(row['price'])
-                    price_str = f"{price_val}"
-                except:
-                    price_str = str(row['price'])
+        return
 
-                # 标题栏信息
-                st.markdown(f"""
-                <div style="background-color:#f0f2f6; padding:10px; border-radius:5px; margin-bottom:5px;">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <h3 style="margin:0; color:#333;">{symbol}</h3>
-                        <div style="text-align:right;">
-                            <span style="font-size:1.2em; font-weight:bold; color:#d32f2f;">+{ratio_pct:.2f}%</span><br>
-                            <span style="font-size:0.9em; color:#666;">💰 +${amount_str}</span>
-                        </div>
-                    </div>
+    # 切片数据
+    start_idx = (current_page - 1) * ITEMS_PER_PAGE
+    end_idx = min(start_idx + ITEMS_PER_PAGE, total_items)
+    current_batch = filtered_df.iloc[start_idx:end_idx]
+
+    # Grid 布局
+    cols = st.columns(2)
+    
+    for i, (_, row) in enumerate(current_batch.iterrows()):
+        with cols[i % 2]:
+            symbol = row['symbol']
+            
+            # --- 数据准备 ---
+            ratio_pct = row['increase_ratio'] * 100
+            inc_val_str = format_money(row['increase_amount_usdt'])
+            
+            # 流通量
+            supply_val = row.get('circ_supply', 0)
+            supply_str = format_money(supply_val)
+            
+            # 流通市值
+            mcap_val = row.get('market_cap', 0)
+            mcap_str = format_money(mcap_val)
+
+            # --- 标题栏 (集中展示) ---
+            # 样式说明：
+            # 第一行：合约名 + 巨大的涨幅百分比
+            # 第二行：增加价值(红色) | 流通量(灰色) | 市值(蓝色)
+            st.markdown(f"""
+            <div style="background-color:#f8f9fa; padding:12px; border-radius:8px; border:1px solid #e0e0e0; margin-bottom:8px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 6px;">
+                    <span style="font-size:1.3em; font-weight:bold; color:#000;">{symbol}</span>
+                    <span style="font-size:1.3em; font-weight:900; color:#d32f2f; background-color:#ffebee; padding:2px 8px; border-radius:4px;">+{ratio_pct:.2f}%</span>
                 </div>
-                """, unsafe_allow_html=True)
-                
-                # 渲染图表
-                render_tradingview_widget(symbol, height=400)
-                st.markdown("---")
+                <div style="display:flex; justify-content:space-between; font-size:0.95em; color:#424242;">
+                    <span><b>OI增资:</b> <span style="color:#d32f2f;">+${inc_val_str}</span></span>
+                    <span><b>流通量:</b> {supply_str}</span>
+                    <span><b>市值:</b> <span style="color:#1976d2;">${mcap_str}</span></span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # 渲染图表
+            render_tradingview_widget(symbol, height=400)
+            st.markdown("<div style='margin-bottom: 20px;'></div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
