@@ -102,8 +102,7 @@ def main():
     # 筛选 > 3%
     filtered_df = df[df['increase_ratio'] > 0.03].copy()
     
-    # 计算流通市值 (如果 CSV 里没有直接提供，就现算)
-    # 假设 CSV 有 'price' 和 'circ_supply'
+    # 计算流通市值
     if 'circ_supply' in filtered_df.columns and 'price' in filtered_df.columns:
         filtered_df['market_cap'] = filtered_df['circ_supply'] * filtered_df['price']
     else:
@@ -112,7 +111,7 @@ def main():
     # 排序
     filtered_df = filtered_df.sort_values(by='increase_ratio', ascending=False)
 
-    # 3. 分页逻辑 (移至主界面)
+    # 3. 分页逻辑
     total_items = len(filtered_df)
     ITEMS_PER_PAGE = 20
     total_pages = max(1, (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
@@ -163,17 +162,18 @@ def main():
             mcap_val = row.get('market_cap', 0)
             mcap_str = format_money(mcap_val)
 
-            # --- 标题栏 (集中展示) ---
-            # 样式说明：
-            # 第一行：合约名 + 巨大的涨幅百分比
-            # 第二行：增加价值(红色) | 流通量(灰色) | 市值(蓝色)
+            # --- 标题栏 (调整版：无竖线，大间距) ---
+            # 调整说明：
+            # 1. 合约名 margin-right 增加到 30px (不那么近)
+            # 2. 第二行数据 gap 增加到 35px (稍微远一点)
+            # 3. 删除了竖线 |
             st.markdown(f"""
-            <div style="background-color:#f8f9fa; padding:12px; border-radius:8px; border:1px solid #e0e0e0; margin-bottom:8px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 6px;">
-                    <span style="font-size:1.3em; font-weight:bold; color:#000;">{symbol}</span>
-                    <span style="font-size:1.3em; font-weight:900; color:#d32f2f; background-color:#ffebee; padding:2px 8px; border-radius:4px;">+{ratio_pct:.2f}%</span>
+            <div style="background-color:#f8f9fa; padding:12px; border-radius:8px; border:1px solid #e0e0e0; margin-bottom:10px;">
+                <div style="display:flex; align-items:center; margin-bottom: 8px;">
+                    <span style="font-size:1.3em; font-weight:bold; color:#000; margin-right: 30px;">{symbol}</span>
+                    <span style="font-size:1.2em; font-weight:900; color:#d32f2f; background-color:#ffebee; padding:2px 10px; border-radius:4px;">+{ratio_pct:.2f}%</span>
                 </div>
-                <div style="display:flex; justify-content:space-between; font-size:0.95em; color:#424242;">
+                <div style="display:flex; flex-wrap:wrap; align-items:center; font-size:0.95em; color:#424242; gap: 35px;">
                     <span><b>OI增资:</b> <span style="color:#d32f2f;">+${inc_val_str}</span></span>
                     <span><b>流通量:</b> {supply_str}</span>
                     <span><b>市值:</b> <span style="color:#1976d2;">${mcap_str}</span></span>
