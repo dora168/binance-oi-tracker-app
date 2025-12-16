@@ -7,7 +7,7 @@ import os
 
 # ================= 核心配置区 =================
 
-# 1. 设置数据源 (固定为你提供的 IP)
+# 1. 设置数据源 (固定 IP)
 DATA_SOURCE = "http://43.156.132.4:8080/oi_analysis.csv"
 
 # ============================================
@@ -92,7 +92,7 @@ def render_tradingview_widget(symbol, height=400):
 
 def main():
     st.set_page_config(layout="wide", page_title="OI 异动监控")
-    st.title("🚀 主力建仓监控 (OI增幅 > 1%)")
+    st.title("🚀 主力建仓监控 (OI增幅 > 3%)")
 
     # 1. 顶部操作栏
     col1, col2 = st.columns([1, 6])
@@ -116,32 +116,64 @@ def main():
         st.dataframe(df.head())
         return
 
-    # === 核心逻辑：只获取增加比例大于 1% 的合约 ===
-    # 假设 increase_ratio 是小数 (例如 0.01 代表 1%)
-    filtered_df = df[df['increase_ratio'] > 0.01]
+    # === 核心逻辑修改：只获取增加比例大于 3% 的合约 ===
+    # 假设 increase_ratio 是小数 (0.03 代表 3%)
+    filtered_df = df[df['increase_ratio'] > 0.03]
 
     # 按比例从高到低排序
     filtered_df = filtered_df.sort_values(by='increase_ratio', ascending=False)
 
-    # 4. 显示结果
+    # 4. 显示结果 & 分页逻辑
     if filtered_df.empty:
-        st.info("😴 当前市场平淡，没有 OI 增幅超过 1% 的合约。")
+        st.info("😴 当前市场平淡，没有 OI 增幅超过 3% 的合约。")
     else:
-        count = len(filtered_df)
-        st.success(f"🔥 发现 {count} 个异动合约！")
+        total_items = len(filtered_df)
+        ITEMS_PER_PAGE = 20
+        
+        # 计算总页数
+        total_pages = (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+        
+        # === 侧边栏：分页控制 ===
+        with st.sidebar:
+            st.header("📄 分页控制")
+            st.write(f"共发现: **{total_items}** 个标的")
+            
+            if total_pages > 1:
+                current_page = st.number_input(
+                    f"页码 (共 {total_pages} 页)", 
+                    min_value=1, 
+                    max_value=total_pages, 
+                    value=1,
+                    step=1
+                )
+            else:
+                current_page = 1
+                st.caption("数量较少，无需分页")
+        
+        # === 数据切片 ===
+        start_idx = (current_page - 1) * ITEMS_PER_PAGE
+        end_idx = min(start_idx + ITEMS_PER_PAGE, total_items)
+        
+        current_batch = filtered_df.iloc[start_idx:end_idx]
+        
+        st.success(f"🔥 发现 {total_items} 个猛烈建仓合约 (当前显示第 {start_idx + 1} - {end_idx} 名)")
         
         # 使用 Grid 布局展示图表 (两列)
         cols = st.columns(2)
         
-        for i, (_, row) in enumerate(filtered_df.iterrows()):
+        for i, (_, row) in enumerate(current_batch.iterrows()):
             with cols[i % 2]:
                 symbol = row['symbol']
                 # 计算百分比显示
                 ratio_pct = row['increase_ratio'] * 100
                 # 使用你指定的 format_money 函数格式化金额
                 amount_str = format_money(row['increase_amount_usdt'])
-                # 价格
-                price_str = row['price']
+                # 价格 (转为float再显示，防止报错)
+                try:
+                    price_val = float(row['price'])
+                    price_str = f"{price_val}"
+                except:
+                    price_str = str(row['price'])
 
                 # 标题栏信息
                 st.markdown(f"""
@@ -149,7 +181,7 @@ def main():
                     <div style="display:flex; justify-content:space-between; align-items:center;">
                         <h3 style="margin:0; color:#333;">{symbol}</h3>
                         <div style="text-align:right;">
-                            <span style="font-size:1.2em; font-weight:bold; color:#009900;">+{ratio_pct:.2f}%</span><br>
+                            <span style="font-size:1.2em; font-weight:bold; color:#d32f2f;">+{ratio_pct:.2f}%</span><br>
                             <span style="font-size:0.9em; color:#666;">💰 +${amount_str}</span>
                         </div>
                     </div>
