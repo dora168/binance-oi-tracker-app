@@ -1,28 +1,32 @@
 import streamlit as st
 import streamlit.components.v1 as components
+import pandas as pd
 import requests
+from io import StringIO
+import os
 
-# --- 核心配置 ---
-# 如果 API 失败，使用这份静态的 Top 50 热门币种列表作为保底
-FALLBACK_SYMBOLS = [
-    "BTC", "ETH", "SOL", "BNB", "DOGE", "XRP", "ADA", "AVAX", "SHIB", "DOT",
-    "LINK", "TRX", "MATIC", "NEAR", "LTC", "BCH", "UNI", "APT", "FIL", "IMX",
-    "ARB", "OP", "INJ", "RNDR", "ATOM", "ETC", "XLM", "STX", "SUI", "VET",
-    "ORDI", "WIF", "PEPE", "THETA", "FTM", "ALGO", "TIA", "SEI", "GRT", "AAVE",
-    "FLOW", "SAND", "MANA", "EGLD", "AXS", "XTZ", "EOS", "QNT", "GALA", "NEO"
-]
+# ================= 核心配置区 =================
 
-# --- 组件：渲染 TradingView Widget ---
+# 🔴 这里必须修改！填入你的 CSV 地址
+# 如果你用了 Cpolar，这里填 Cpolar 给你的公网地址，例如：
+# DATA_SOURCE = "http://2808xxxx.cpolar.cn/oi_analysis.csv"
+
+# 如果你在局域网，填服务器的内网 IP，例如：
+# DATA_SOURCE = "http://192.168.1.100:8080/oi_analysis.csv"
+
+# 默认占位符（你需要改掉它）
+DATA_SOURCE = "http://43.156.132.4:8080/oi_analysis.csv" 
+
+# ============================================
+
 def render_tradingview_widget(symbol, height=400):
-    """
-    渲染嵌入 Open Interest (OI) 指标的 TradingView Widget
-    """
+    """渲染嵌入 Open Interest (OI) 指标的 TradingView Widget"""
     # 清洗数据，确保格式为纯币种名称 (例如 BTC)
     clean_symbol = symbol.upper().strip()
     if clean_symbol.endswith("USDT"):
         clean_symbol = clean_symbol[:-4]
     
-    # 构造 TradingView 能够识别的 币安永续合约 代码
+    # 构造 TradingView 能够识别的代码
     tv_symbol = f"BINANCE:{clean_symbol}USDT.P"
     container_id = f"tv_{clean_symbol}"
 
@@ -61,103 +65,145 @@ def render_tradingview_widget(symbol, height=400):
     """
     components.html(html_code, height=height, scrolling=False)
 
-# --- 数据获取：带容错机制 ---
-@st.cache_data(ttl=600) # 缓存10分钟
-def get_market_data(limit=100):
-    """
-    尝试从 API 获取数据，如果失败（被墙），则返回保底列表。
-    """
-    # 尝试 1: CoinGecko API (比币安更容易在云端访问)
+def format_money(num):
+    """将数字格式化为 B/M/K"""
     try:
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {
-            "vs_currency": "usd",
-            "order": "volume_desc", # 按成交量排序
-            "per_page": limit,
-            "page": 1,
-            "sparkline": "false"
-        }
-        response = requests.get(url, params=params, timeout=3)
-        if response.status_code == 200:
-            data = response.json()
-            # 提取 symbol 并转大写
-            return [item['symbol'].upper() for item in data], "API (CoinGecko)"
+        num = float(num)
+        if num >= 1_000_000_000: return f"{num/1_000_000_000:.2f}B"
+        if num >= 1_000_000: return f"{num/1_000_000:.2f}M"
+        if num >= 1_000: return f"{num/1_000:.0f}K"
+        return f"{num:.0f}"
     except:
-        pass
+        return str(num)
 
-    # 尝试 2: 币安 API (在本地有效，但云端常被封锁)
+def load_data(source):
+    """加载远程或本地 CSV 数据"""
     try:
-        url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-        response = requests.get(url, timeout=3)
-        if response.status_code == 200:
-            data = response.json()
-            usdt_pairs = [x for x in data if x['symbol'].endswith('USDT') and '_' not in x['symbol']]
-            sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x['quoteVolume']), reverse=True)
-            # 这里的 symbol 已经是 BTCUSDT 格式
-            return [x['symbol'] for x in sorted_pairs[:limit]], "API (Binance)"
-    except:
-        pass
-
-    # 如果都失败，返回保底列表
-    return FALLBACK_SYMBOLS, "离线保底列表 (API 连接受限)"
+        # 如果是 HTTP 链接
+        if source.startswith("http"):
+            response = requests.get(source, timeout=10)
+            if response.status_code != 200:
+                st.error(f"❌ 无法连接到数据源 (状态码: {response.status_code})")
+                return pd.DataFrame()
+            
+            # 尝试用 utf-8-sig 解码 (兼容中文)
+            try:
+                content = response.content.decode('utf-8-sig')
+            except:
+                content = response.content.decode('gbk') # 备用 GBK 解码
+            
+            df = pd.read_csv(StringIO(content))
+        
+        # 如果是本地文件路径 (备用)
+        else:
+            if not os.path.exists(source):
+                st.error(f"❌ 文件不存在: {source}")
+                return pd.DataFrame()
+            df = pd.read_csv(source)
+            
+        return df
+    except Exception as e:
+        st.error(f"❌ 数据加载出错: {e}")
+        return pd.DataFrame()
 
 # --- 主程序逻辑 ---
 def main():
-    st.set_page_config(layout="wide", page_title="Crypto OI Wall")
+    st.set_page_config(layout="wide", page_title="OI 异常监控墙")
+    st.title("🚀 主力建仓监控 (基于3日Min-Max)")
+
+    # 1. 刷新按钮
+    if st.button("🔄 刷新数据"):
+        st.cache_data.clear()
+        st.rerun()
+
+    # 2. 加载数据
+    with st.spinner(f"正在从 {DATA_SOURCE} 获取数据..."):
+        df = load_data(DATA_SOURCE)
     
-    st.title("⚡ 币安成交量 Top 100 - OI 监控墙")
+    if df.empty:
+        st.warning("暂无数据。请检查服务器端的 Python HTTP 服务是否开启，以及 Cpolar 地址是否正确。")
+        st.stop()
 
-    # 1. 获取数据
-    with st.spinner("正在加载市场数据..."):
-        symbols, source_type = get_market_data(100)
-
-    # 2. 侧边栏控制
+    # 3. 侧边栏筛选
     with st.sidebar:
-        st.header("⚙️ 控制面板")
+        st.header("🔍 筛选条件")
         
-        # 显示数据源状态
-        if "离线" in source_type:
-            st.warning(f"⚠️ 当前使用：{source_type}")
-            st.caption("原因：云服务器 IP 可能被交易所暂时拦截，已自动切换至预设热门币种，不影响图表查看。")
+        # 增加比例滑块
+        min_ratio = st.slider("最小增加比例 (%)", 0.0, 10.0, 0.5, step=0.1)
+        
+        # 将小数转为百分比用于筛选 (假设CSV里 increase_ratio 是小数)
+        # 兼容处理：先复制一份
+        df_display = df.copy()
+        if 'increase_ratio' in df_display.columns:
+            df_display['ratio_pct'] = df_display['increase_ratio'] * 100
         else:
-            st.success(f"✅ 数据来源：{source_type}")
-
-        if st.button("强制刷新数据"):
-            st.cache_data.clear()
-            st.rerun()
+            st.error("CSV 中缺少 'increase_ratio' 列")
+            st.stop()
             
+        filtered_df = df_display[df_display['ratio_pct'] >= min_ratio]
+        
+        st.write(f"监控总数: {len(df)}")
+        st.write(f"符合条件: {len(filtered_df)}")
         st.markdown("---")
         
         # 分页设置
-        total_items = len(symbols)
-        items_per_page = st.select_slider("每页显示数量", options=[10, 20, 50, 100], value=50)
+        items_per_page = st.select_slider("每页显示图表数", options=[10, 20, 50], value=20)
+        total_items = len(filtered_df)
+        total_pages = max(1, (total_items + items_per_page - 1) // items_per_page)
+        current_page = st.number_input(f"页码 (共 {total_pages} 页)", 1, total_pages, 1)
+
+    # 4. 显示数据表格 (Top 榜单)
+    st.subheader("📊 异动排行榜")
+    if not filtered_df.empty:
+        # 格式化显示的列
+        table_df = filtered_df.copy()
+        table_df['increase_amount_usdt'] = table_df['increase_amount_usdt'].apply(lambda x: f"${format_money(x)}")
+        table_df['ratio_pct'] = table_df['ratio_pct'].apply(lambda x: f"{x:.2f}%")
+        table_df['price'] = table_df['price'].apply(lambda x: f"${float(x):.4f}")
         
-        # 计算页数
-        total_pages = (total_items + items_per_page - 1) // items_per_page
-        current_page = st.number_input(f"页码 (共 {total_pages} 页)", min_value=1, max_value=total_pages, value=1)
+        # 只显示关键列
+        cols_to_show = ['symbol', 'ratio_pct', 'increase_amount_usdt', 'price']
+        # 确保这些列都存在
+        cols_to_show = [c for c in cols_to_show if c in table_df.columns]
+        
+        st.dataframe(
+            table_df[cols_to_show],
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("当前没有符合筛选条件的币种。")
 
-    # 3. 数据切片
-    start_idx = (current_page - 1) * items_per_page
-    end_idx = min(start_idx + items_per_page, total_items)
-    current_batch = symbols[start_idx:end_idx]
+    st.markdown("---")
 
-    # 4. 页面显示
-    st.markdown(f"**当前显示：第 {start_idx + 1} - {end_idx} 名**")
-    
-    # 渲染图表 Grid
-    cols = st.columns(2) # 两列布局
-    for i, sym in enumerate(current_batch):
-        with cols[i % 2]:
-            # 生成跳转链接
-            link_symbol = sym.replace("USDT", "")
-            url = f"https://www.coinglass.com/tv/zh/Binance_{link_symbol}USDT"
-            
-            st.markdown(f"#### #{start_idx + i + 1} {sym} ([Coinglass]({url}))")
-            render_tradingview_widget(sym)
-            st.markdown("---")
+    # 5. K线墙展示 (分页)
+    if not filtered_df.empty:
+        start_idx = (current_page - 1) * items_per_page
+        end_idx = min(start_idx + items_per_page, total_items)
+        current_batch = filtered_df.iloc[start_idx:end_idx]
 
-    if end_idx >= total_items:
-        st.success("已显示全部加载的币种。")
+        st.subheader(f"📈 重点监控图表 ({start_idx+1} - {end_idx})")
+        
+        cols = st.columns(2) # 两列布局
+        for i, (_, row) in enumerate(current_batch.iterrows()):
+            with cols[i % 2]:
+                symbol = row['symbol']
+                ratio = row['ratio_pct']
+                money = format_money(row['increase_amount_usdt'])
+                
+                # 标题栏
+                st.markdown(f"""
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                    <h3 style="margin:0;">{symbol}</h3>
+                    <div style="text-align:right;">
+                        <span style="color:#4CAF50; font-weight:bold; font-size:1.2em;">+{ratio:.2f}%</span><br>
+                        <span style="color:gray; font-size:0.9em;">💰 +${money}</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                render_tradingview_widget(symbol)
+                st.markdown("---")
 
 if __name__ == "__main__":
     main()
