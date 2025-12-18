@@ -3,7 +3,6 @@ import streamlit.components.v1 as components
 import pandas as pd
 import requests
 from io import StringIO
-import os
 
 # ================= 核心配置区 =================
 
@@ -42,12 +41,13 @@ def load_data(url):
         st.error(f"❌ 数据加载失败: {e}")
         return pd.DataFrame()
 
-def render_tradingview_widget(symbol, height=400):
+def render_tradingview_widget(symbol, height=450):
     """渲染 TradingView 组件"""
     clean_symbol = symbol.upper().strip()
     tv_symbol = f"BINANCE:{clean_symbol}.P"
     container_id = f"tv_{clean_symbol}"
 
+    # 在 studies 列表中增加了多空比指标
     html_code = f"""
     <div class="tradingview-widget-container" style="height: {height}px; width: 100%;">
       <div id="{container_id}" style="height: 100%; width: 100%;"></div>
@@ -69,7 +69,8 @@ def render_tradingview_widget(symbol, height=400):
         "container_id": "{container_id}",
         "studies": [
             "MASimple@tv-basicstudies",     
-            "STD;Fund_crypto_open_interest"
+            "STD;Fund_crypto_open_interest",
+            "STD;Fund_long_short_ratio"
         ],
         "disabled_features": [
             "header_symbol_search", "header_compare", "use_localstorage_for_settings", 
@@ -99,39 +100,33 @@ def main():
         st.error("数据缺失 'increase_ratio' 列")
         return
 
-    # 筛选 > 3%
     filtered_df = df[df['increase_ratio'] > 0.03].copy()
     
-    # 计算流通市值
     if 'circ_supply' in filtered_df.columns and 'price' in filtered_df.columns:
         filtered_df['market_cap'] = filtered_df['circ_supply'] * filtered_df['price']
     else:
         filtered_df['market_cap'] = 0
 
-    # 排序
     filtered_df = filtered_df.sort_values(by='increase_ratio', ascending=False)
 
-    # 3. 分页逻辑
+    # 3. 分页逻辑准备
     total_items = len(filtered_df)
     ITEMS_PER_PAGE = 20
     total_pages = max(1, (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
 
-    # --- 顶部控制栏 ---
-    c1, c2, c3 = st.columns([1, 2, 3])
+    # --- 顶部控制栏 (仅保留刷新和统计) ---
+    c1, c2 = st.columns([1, 5])
     with c1:
         if st.button("🔄 刷新数据", type="primary", use_container_width=True):
             st.rerun()
     with c2:
-        if total_pages > 1:
-            current_page = st.number_input(
-                f"当前页 (共 {total_pages} 页, {total_items} 个标的)", 
-                min_value=1, max_value=total_pages, value=1, step=1
-            )
-        else:
-            current_page = 1
-            st.markdown(f"**共发现 {total_items} 个标的**")
+        st.markdown(f"<div style='padding-top:7px;'><b>共发现 {total_items} 个标的，分为 {total_pages} 页显示</b></div>", unsafe_allow_html=True)
     
     st.markdown("---")
+
+    # 获取当前页码 (使用 Session State 确保翻页流畅)
+    if 'page' not in st.session_state:
+        st.session_state.page = 1
 
     # 4. 显示内容
     if filtered_df.empty:
@@ -139,7 +134,7 @@ def main():
         return
 
     # 切片数据
-    start_idx = (current_page - 1) * ITEMS_PER_PAGE
+    start_idx = (st.session_state.page - 1) * ITEMS_PER_PAGE
     end_idx = min(start_idx + ITEMS_PER_PAGE, total_items)
     current_batch = filtered_df.iloc[start_idx:end_idx]
 
@@ -149,24 +144,11 @@ def main():
     for i, (_, row) in enumerate(current_batch.iterrows()):
         with cols[i % 2]:
             symbol = row['symbol']
-            
-            # --- 数据准备 ---
             ratio_pct = row['increase_ratio'] * 100
             inc_val_str = format_money(row['increase_amount_usdt'])
-            
-            # 流通量
-            supply_val = row.get('circ_supply', 0)
-            supply_str = format_money(supply_val)
-            
-            # 流通市值
-            mcap_val = row.get('market_cap', 0)
-            mcap_str = format_money(mcap_val)
+            supply_str = format_money(row.get('circ_supply', 0))
+            mcap_str = format_money(row.get('market_cap', 0))
 
-            # --- 标题栏 (调整版：无竖线，大间距) ---
-            # 调整说明：
-            # 1. 合约名 margin-right 增加到 30px (不那么近)
-            # 2. 第二行数据 gap 增加到 35px (稍微远一点)
-            # 3. 删除了竖线 |
             st.markdown(f"""
             <div style="background-color:#f8f9fa; padding:12px; border-radius:8px; border:1px solid #e0e0e0; margin-bottom:10px;">
                 <div style="display:flex; align-items:center; margin-bottom: 8px;">
@@ -181,9 +163,25 @@ def main():
             </div>
             """, unsafe_allow_html=True)
             
-            # 渲染图表
-            render_tradingview_widget(symbol, height=400)
-            st.markdown("<div style='margin-bottom: 20px;'></div>", unsafe_allow_html=True)
+            render_tradingview_widget(symbol, height=450) # 略微增加高度以容纳新指标
+            st.markdown("<div style='margin-bottom: 30px;'></div>", unsafe_allow_html=True)
+
+    # --- 底部控制栏 (翻页装置) ---
+    st.markdown("---")
+    footer_c1, footer_c2, footer_c3 = st.columns([2, 1, 2])
+    with footer_c2:
+        if total_pages > 1:
+            new_page = st.number_input(
+                f"跳至页码 (1-{total_pages})", 
+                min_value=1, max_value=total_pages, 
+                value=st.session_state.page, 
+                key="page_input"
+            )
+            if new_page != st.session_state.page:
+                st.session_state.page = new_page
+                st.rerun()
+        else:
+            st.markdown("<p style='text-align:center;'>已显示全部数据</p>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
