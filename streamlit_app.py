@@ -70,7 +70,7 @@ def render_tradingview_widget(symbol, height=450):
         "studies": [
             "MASimple@tv-basicstudies",     
             "STD;Fund_crypto_open_interest",
-            "Internal$STD;Fund_long_short_ratio"
+            "STD;Fund_long_short_ratio"
         ],
         "disabled_features": [
             "header_symbol_search", "header_compare", "use_localstorage_for_settings", 
