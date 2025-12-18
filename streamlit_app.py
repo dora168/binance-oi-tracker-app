@@ -60,8 +60,8 @@ def render_tradingview_widget(symbol, height=580):
         "container_id": "{container_id}",
         "studies": [
             "MASimple@tv-basicstudies",     
-            "STD;Fund_crypto_open_interest",
-            "STD;Fund_long_short_ratio"
+            "STD;Fund_long_short_ratio",
+            "STD;Fund_crypto_open_interest"
         ],
         "disabled_features": [
             "header_symbol_search", 
