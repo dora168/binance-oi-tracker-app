@@ -21,7 +21,7 @@ def format_money(num):
     except:
         return str(num)
 
-# --- 添加数据缓存，有效期 60 秒 ---
+# --- 添加数据缓存，有效期 600 秒 ---
 @st.cache_data(ttl=600)
 def load_data(url):
     try:
@@ -89,7 +89,7 @@ def main():
         st.session_state.page = 1
 
     # --- 顶部统计 ---
-    st.info(f"📊 监控运行中 | 发现 {total_items} 个标的 | 缓存每 60 秒刷新")
+    st.info(f"📊 监控运行中 | 发现 {total_items} 个标的 | 缓存每 10 分钟刷新")
     
     start_idx = (st.session_state.page - 1) * ITEMS_PER_PAGE
     end_idx = min(start_idx + ITEMS_PER_PAGE, total_items)
@@ -103,8 +103,9 @@ def main():
             ratio_pct = row['increase_ratio'] * 100
             inc_val = format_money(row['increase_amount_usdt'])
             mcap = format_money(row.get('market_cap', 0))
+            supply = format_money(row.get('circ_supply', 0)) # 获取流通量
 
-            # 精简后的卡片布局
+            # 修改后的卡片布局：增加了流通量展示
             st.markdown(f"""
             <div style="background-color:#ffffff; padding:15px; border-radius:10px; border:2px solid #f0f2f6; margin-bottom:10px;">
                 <div style="display:flex; justify-content: space-between; align-items: center;">
@@ -113,9 +114,10 @@ def main():
                         +{ratio_pct:.2f}%
                     </span>
                 </div>
-                <div style="margin-top:10px; color:#666; font-size:1em;">
-                    <b>OI 增资:</b> <span style="color:#d32f2f;">${inc_val}</span> | 
-                    <b>市值:</b> <span style="color:#1976d2;">${mcap}</span>
+                <div style="margin-top:10px; color:#444; font-size:0.95em; display:flex; gap:15px; flex-wrap:wrap;">
+                    <span><b>OI 增资:</b> <span style="color:#d32f2f; font-weight:bold;">${inc_val}</span></span>
+                    <span><b>流通量:</b> <span style="font-weight:bold;">{supply}</span></span>
+                    <span><b>市值:</b> <span style="color:#1976d2; font-weight:bold;">${mcap}</span></span>
                 </div>
             </div>
             """, unsafe_allow_html=True)
