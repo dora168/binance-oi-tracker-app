@@ -8,7 +8,7 @@ from io import StringIO
 # 1. 设置数据源
 DATA_SOURCE = "http://43.156.132.4:8080/oi_analysis.csv"
 # 2. 每页显示数量 (不使用折叠时，建议设为 10 以防浏览器崩溃)
-ITEMS_PER_PAGE = 10 
+ITEMS_PER_PAGE = 8
 # ============================================
 
 def format_money(num):
