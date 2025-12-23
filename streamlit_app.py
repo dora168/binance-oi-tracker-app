@@ -22,7 +22,7 @@ def format_money(num):
         return str(num)
 
 # --- 添加数据缓存，有效期 60 秒 ---
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=600)
 def load_data(url):
     try:
         response = requests.get(url, timeout=10)
